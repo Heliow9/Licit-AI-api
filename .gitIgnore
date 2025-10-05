@@ -1,0 +1,15 @@
+# Ignorar pasta data na raiz
+/data/
+
+# Ignorar dependências do Node (qualquer nível)
+node_modules/
+.env
+.env
+.env.*
+*.env
+*.env.*
+
+.env
+.env.*
+*.env
+*.env.*

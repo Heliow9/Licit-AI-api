@@ -1,3 +1,27 @@
+
+
+// --- debug: rastrear quem imprime "not supported" ---
+const _stderrWrite = process.stderr.write.bind(process.stderr);
+process.stderr.write = (chunk, ...rest) => {
+  try {
+    const s = (chunk && chunk.toString) ? chunk.toString() : String(chunk);
+    if (s.toLowerCase().includes('not supported')) {
+      console.log('[TRACE not supported] stack:\n', new Error().stack);
+    }
+  } catch {}
+  return _stderrWrite(chunk, ...rest);
+};
+
+const _origError = console.error;
+console.error = (...args) => {
+  if (args.join(' ').toLowerCase().includes('not supported')) {
+    _origError('[TRACE not supported] stack:\n', new Error().stack);
+  }
+  return _origError(...args);
+};
+
+
+
 // app.js
 const express = require('express');
 const cors = require('cors');

@@ -23,6 +23,9 @@ const {
 
 const PDFDocument = require('pdfkit');
 
+const REPORTS_BASE_DIR = path.join(process.cwd(), 'data', 'reports');
+const companyReportsDir = (companyId) => path.join(REPORTS_BASE_DIR, String(companyId || 'unknown'));
+
 function cleanTextForPdf(text = '') {
   const zwsp = '\u200B';
   return String(text)
@@ -33,8 +36,8 @@ function cleanTextForPdf(text = '') {
     .replace(/([A-Za-z0-9_/\\\-]{30,})/g, (m) => m.split('').join(zwsp));
 }
 
-async function gerarPdf(markdown) {
-  const reportsDir = path.join(process.cwd(), 'data', 'reports');
+async function gerarPdf(markdown, companyId) {
+  const reportsDir = companyReportsDir(companyId);
   fs.mkdirSync(reportsDir, { recursive: true });
   const filename = `relatorio_viabilidade_${Date.now()}.pdf`;
   const outPath = path.join(reportsDir, filename);
@@ -60,29 +63,24 @@ async function gerarPdf(markdown) {
 }
 
 /**
- * Core da análise que NÃO escreve resposta HTTP; usa callbacks de progresso e retorna o payload final.
- * @param {{mainEditalFile: Express.Multer.File, annexFiles: Express.Multer.File[]}} files
- * @param {(pct:number, phase:string)=>void} onProgress
- * @returns {Promise<{report:string, pdf?:{filename:string,url:string,path:string}}>}
+ * Core da análise que NÃO escreve resposta HTTP.
+ * Agora aceita { companyId } em opts (back-compat se não mandar).
  */
-async function analisarEditalCore(files, onProgress = () => {}) {
+async function analisarEditalCore(files, onProgress = () => {}, opts = {}) {
+  const { companyId } = opts || {};
   const bump = (pct, phase) => { try { onProgress(pct, phase); } catch {} };
 
-  // Conecta no Mongo (opcional)
   let collection = null;
   try {
     const db = await getDb();
     collection = db.collection('chunks');
-  } catch (e) {
-    // segue sem mongo
-  }
+  } catch {}
 
   const mainEditalFile = files.mainEditalFile;
   const annexFiles = files.annexFiles || [];
   const allUploadedFiles = [mainEditalFile, ...annexFiles];
 
   try {
-    // OCR principal
     const rawPdf = fs.readFileSync(mainEditalFile.path);
     const mainEditalText = await extractTextFromPdf(rawPdf, mainEditalFile.path);
     if (!mainEditalText?.trim()) {
@@ -91,7 +89,6 @@ async function analisarEditalCore(files, onProgress = () => {}) {
     const editalText = mainEditalText.slice(0, MAX_EDITALTEXT_CHARS || 200000);
     bump(15, 'OCR do edital');
 
-    // wrappers p/ busca
     const filesForEvidenceSearch = await Promise.all(
       allUploadedFiles.map(async (file) => ({
         source: file.originalname,
@@ -99,7 +96,6 @@ async function analisarEditalCore(files, onProgress = () => {}) {
       }))
     );
 
-    // textos locais
     const localFilesText = [];
     for (let i = 0; i < filesForEvidenceSearch.length; i++) {
       try {
@@ -109,39 +105,32 @@ async function analisarEditalCore(files, onProgress = () => {}) {
     }
     bump(25, 'Textos locais prontos');
 
-    // header e assinaturas
     const header = (() => {
-      const { concorrenciaEletronica, tipo, prazoExecucao, classificacaoDespesaEValor, objetoLicitado, prazoMaximoParaProposta, orgaoLicitante } =
-        require('./editalController').__getParseHeader
-          ? require('./editalController').__getParseHeader(editalText)
-          : (() => {
-              // fallback simples (se não exportou helper)
-              return { objetoLicitado: (editalText.match(/OBJETO[\s\S]{0,800}/i)?.[0] || '').slice(0, 800) };
-            })();
-      return { concorrenciaEletronica, tipo, prazoExecucao, classificacaoDespesaEValor, objetoLicitado, prazoMaximoParaProposta, orgaoLicitante };
+      const api = require('../controllers/editalController');
+      if (api.__getParseHeader) return api.__getParseHeader(editalText);
+      return { objetoLicitado: (editalText.match(/OBJETO[\s\S]{0,800}/i)?.[0] || '').slice(0, 800) };
     })();
     const objSigs = signaturesFor(header.objetoLicitado || editalText);
     bump(30, 'Cabeçalho extraído');
 
-    // CATs
-    let totalCandidatesEstimate = 1;
     const allCatsRaw = await findCATMatches(
-      collection,
+      collection ? { chunksCol: collection } : null,
       header.objetoLicitado || editalText,
       8,
       localFilesText,
-      { debug: (evt) => { if (evt.kind === 'scored') bump(55, 'CATs pontuadas'); } }
+      { companyId } // << filtra por empresa se o service suportar
     );
     const dedupCats = uniqueByCat(allCatsRaw).map(c => ({ ...c, ano: pickReasonableYear(c.raw) || c.ano || '' }));
-    const ranked = dedupCats.map(c => ({ meta: c, score: scoreCatToObjetoLote(c, header.objetoLicitado || editalText, (header.concorrenciaEletronica||'')+'\n'+(header.tipo||'')) }))
-                            .sort((a,b)=>b.score-a.score);
+    const ranked = dedupCats.map(c => ({
+      meta: c,
+      score: scoreCatToObjetoLote(c, header.objetoLicitado || editalText, (header.concorrenciaEletronica||'')+'\n'+(header.tipo||''))
+    })).sort((a,b)=>b.score-a.score);
     const MIN_ALIGN_SCORE = 5;
     const rankedCats = ranked.filter(r=> r.score >= (MIN_ALIGN_SCORE-2)).map(r=>r.meta);
     const topCats = rankedCats.slice(0,2);
     const domainAligned = ranked.slice(0,2).some(r=> r.score >= MIN_ALIGN_SCORE);
     bump(60, 'CATs selecionadas');
 
-    // Requisitos
     const allRequirements = await extractRequirementsFromBid(editalText);
     const requirementsToAnalyze = (allRequirements||[]).filter(r=> !/credenciamento|chave|senha|licitanet|comprasnet|bll|enviar proposta/i.test(r||''));
     const detailedAnalyses = [];
@@ -158,13 +147,12 @@ async function analisarEditalCore(files, onProgress = () => {}) {
         const note   = domainAligned ? '' : '\n\n> Observação: CATs localizadas com aderência parcial; recomenda-se substituir por CATs do mesmo escopo do edital.';
         detailedAnalyses.push(`Requisito: ${reqTxt}\n\n${status}\n\nA qualificação técnica é suportada pelas seguintes CATs do acervo:\n${bullets}${note}`);
       } else {
-        const evidence = await findEvidenceOnTheFly(reqTxt, filesForEvidenceSearch, collection);
+        const evidence = await findEvidenceOnTheFly(reqTxt, filesForEvidenceSearch, collection, { companyId });
         detailedAnalyses.push(await analyzeSingleRequirement(reqTxt, evidence));
       }
       if (i % 3 === 0) bump(Math.min(80, 60 + Math.round((i+1)/Math.max(1,requirementsToAnalyze.length)*20)), 'Analisando requisitos');
     }
 
-    // Bloco viabilidade
     const blocoViabilidade = (topCats.length
       ? `### Viabilidade profissional e técnica
 
@@ -180,7 +168,6 @@ ${topCats.map(c=>{
       : '### Viabilidade profissional e técnica\n\n- **Não localizamos CATs aderentes automaticamente.** Recomenda-se checagem manual do acervo.'
     );
 
-    // RT sugerido
     const rtSugerido = suggestBestRT(topCats, header.objetoLicitado || editalText);
     let blocoRT = '';
     if (rtSugerido){
@@ -199,11 +186,9 @@ ${topCats.map(c=>{
       ].join('\n\n');
     }
 
-    // Sumário (versão balanceada que você instalou)
     let summary = await generateExecutiveSummary(detailedAnalyses, header.objetoLicitado || '');
     bump(90, 'Sumário executivo');
 
-    // Relatório final
     const headerItems = [
       `### Órgão Licitório\n${header.orgaoLicitante || '-'}`,
       `### Concorrência Eletrônica\n${header.concorrenciaEletronica || '-'}`,
@@ -228,16 +213,14 @@ ${topCats.map(c=>{
       detailedAnalyses.join('\n\n---\n\n') || '- (Não foi possível gerar a análise detalhada)'
     ].join('\n\n');
 
-    const { publicUrl, filePath, filename } = await gerarPdf(finalReport);
+    const { publicUrl, filePath, filename } = await gerarPdf(finalReport, companyId);
     bump(100, 'PDF emitido');
 
-    // limpeza dos uploads
     for (const f of allUploadedFiles) { try { if (f?.path && fs.existsSync(f.path)) fs.unlinkSync(f.path); } catch {} }
 
     return { report: finalReport, pdf: { filename, url: publicUrl, path: filePath } };
 
   } catch (error) {
-    // limpeza em erro também
     for (const f of allUploadedFiles) { try { if (f?.path && fs.existsSync(f.path)) fs.unlinkSync(f.path); } catch {} }
     throw error;
   }

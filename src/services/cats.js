@@ -1,4 +1,5 @@
 // services/cats.js
+const { ObjectId } = require('mongodb');
 const { extractCATMeta } = require('../utils/cat_meta');
 
 /** Taxonomia de domínios + palavras-chave (facilmente expandível) */
@@ -124,24 +125,25 @@ function pathSafeFileName(src = '') {
   return parts[parts.length - 1] || p;
 }
 
+function toOid(v) {
+  try { return new ObjectId(String(v)); } catch { return null; }
+}
+function buildTenantFilter(tenantId) {
+  if (!tenantId) return null;
+  const oid = toOid(tenantId);
+  return { $or: [{ companyId: String(tenantId) }, ...(oid ? [{ companyId: oid }] : [])] };
+}
+
 /**
- * Busca híbrida por CATs:
- * - Mongo (preferencial), agora consultando DUAS coleções:
- *   -> cats  (com fileName/fullText)
- *   -> chunks (compatibilidade com índice vetorial/regex por texto)
- * - Arquivos locais enviados (fallback/combinação)
- * opts.debug(evt) recebe eventos: {kind, total?, i?, source?, offset?}
- *
- * Aceita:
- *   - collectionOrChunks = { catsCol, chunksCol }  (preferível)
- *   - collectionOrChunks = chunksCol                (compatibilidade)
+ * Busca híbrida por CATs (multi-tenant ready):
+ *   findCATMatches({ catsCol, chunksCol }, objetoText, limit, localFiles, { tenantId, debug })
  */
 async function findCATMatches(collectionOrChunks, objetoText, limit = 6, localFiles = [], opts = {}) {
   const termSet = baseTermSet(objetoText || '');
   const debug = typeof opts.debug === 'function' ? opts.debug : () => {};
+  const tenantFilter = buildTenantFilter(opts.tenantId);
   let cats = [];
 
-  // Aceitar collection única (chunks) ou objeto { catsCol, chunksCol }
   const catsCol   = collectionOrChunks?.catsCol || null;
   const chunksCol = collectionOrChunks?.chunksCol || (collectionOrChunks && !collectionOrChunks.catsCol ? collectionOrChunks : null);
 
@@ -156,16 +158,22 @@ async function findCATMatches(collectionOrChunks, objetoText, limit = 6, localFi
       ]
     };
 
-    const domainFilter = objDomains.length
+    // Usa TODOS os domínios detectados
+    const domainTerms = objDomains.flatMap(d => DOMAIN_LEXICON[d] || []);
+    const domainFilter = domainTerms.length
       ? {
           $or: [
-            { fileName: { $regex: (DOMAIN_LEXICON[objDomains[0]] || []).join('|'), $options: 'i' } },
-            { fullText: { $regex: (DOMAIN_LEXICON[objDomains[0]] || []).join('|'), $options: 'i' } }
+            { fileName: { $regex: domainTerms.join('|'), $options: 'i' } },
+            { fullText: { $regex: domainTerms.join('|'), $options: 'i' } }
           ]
         }
       : null;
 
-    const q = domainFilter ? { $and: [ mustBeCAT, domainFilter ] } : mustBeCAT;
+    const ands = [mustBeCAT];
+    if (domainFilter) ands.push(domainFilter);
+    if (tenantFilter) ands.push(tenantFilter);
+
+    const q = ands.length > 1 ? { $and: ands } : ands[0];
 
     const proj = { _id: 0, source: 1, fileName: 1, fullText: 1 };
     const catsDocs = await catsCol.find(q, { projection: proj }).limit(limit * 5).toArray();
@@ -178,14 +186,17 @@ async function findCATMatches(collectionOrChunks, objetoText, limit = 6, localFi
     }
   }
 
-  // ====== 2) Coleção CHUNKS (compatibilidade com o código atual)
+  // ====== 2) Coleção CHUNKS (compatibilidade)
   if (chunksCol) {
     const orTerms = Array.from(termSet).map(t => ({ text: { $regex: t, $options: 'i' } }));
     const mustBeCAT = [
       { text: { $regex: 'Certid[aã]o de Acervo T[ée]cnico', $options: 'i' } },
       { text: { $regex: '\\bCAT\\b', $options: 'i' } },
     ];
-    const q = { $and: [ { $or: mustBeCAT }, { $or: orTerms } ] };
+    const ands = [{ $or: mustBeCAT }, { $or: orTerms }];
+    if (tenantFilter) ands.push(tenantFilter);
+    const q = { $and: ands };
+
     const chunks = await chunksCol.find(q, { projection: { _id: 0, source: 1, text: 1 } }).limit(limit * 3).toArray();
 
     debug({ kind: 'mongoBatchChunks', total: chunks.length });
@@ -207,7 +218,6 @@ async function findCATMatches(collectionOrChunks, objetoText, limit = 6, localFi
   for (const f of localFiles) {
     if (!f?.text) continue;
     if (!(looksLikeCATName(f.source) || strongCATFingerprint(f.text))) continue;
-
     if (Array.from(termSet).some(t => new RegExp(String(t), 'i').test(f.text))) {
       localCandidates.push({ source: f.source, fileName: f.source, text: f.text });
     }
@@ -221,9 +231,18 @@ async function findCATMatches(collectionOrChunks, objetoText, limit = 6, localFi
 
   // ====== 4) Scoring + filtros (inclui sinais do filename)
   const scored = (cats || []).map(c => {
-    const metaFromText = extractCATMeta(c.source, c.text || ''); // extrai hasART/hasCREA/mentions...
+    const metaFromText = extractCATMeta(c.source, c.text || '');
     const fromName = parseFilenameMeta(c.fileName || c.source || '');
-    const meta = { ...metaFromText, fileName: c.fileName, raw: metaFromText.raw, fileHints: fromName };
+
+    // 🔧 junta hints (não sobrescreve os que já existirem no meta)
+    const mergedHints = { ...(metaFromText.fileHints || {}), ...fromName };
+
+    const meta = {
+      ...metaFromText,
+      fileName: c.fileName,
+      raw: metaFromText.raw,
+      fileHints: mergedHints
+    };
 
     let score = 0;
 
@@ -261,9 +280,7 @@ async function findCATMatches(collectionOrChunks, objetoText, limit = 6, localFi
   .slice(0, limit * 3);
 
   debug({ kind: 'scored', count: scored.length });
-  
   return scored.map(s => s.meta);
-  
 }
 
 /** Ano razoável (capado em ano atual + 1 para evitar “2071”) */
@@ -297,11 +314,11 @@ function scoreCatToObjetoLote(cat, objeto = '', lote = '') {
 
   let sc = 0;
 
-  // BÔNUS mais forte por casar domínios
+  // BÔNUS por casar domínios
   for (const dom of objSigs) if (catSigs.has(dom)) sc += 4;
   for (const dom of loteSigs) if (catSigs.has(dom)) sc += 2;
 
-  // Penalidade MAIS FORTE por conflitos
+  // Penalidade por conflitos
   for (const dom of Object.keys(DOMAIN_LEXICON)) {
     if (objSigs.size && !objSigs.has(dom) && catSigs.has(dom)) sc -= 5;
   }
@@ -312,7 +329,7 @@ function scoreCatToObjetoLote(cat, objeto = '', lote = '') {
   if (cat.mentionsManut) sc += 1;
   if (cat.mentionsObra) sc += 1;
 
-  // Recência suavizada (considera ano do filename também)
+  // Recência
   const yr = Number(pickReasonableYear(cat.raw)) || Number(cat.fileHints?.fileYear) || 0;
   if (yr) sc += (yr - 2015) / 10;
 

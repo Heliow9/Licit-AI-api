@@ -1,9 +1,7 @@
 // src/controllers/companyController.js
 const Companies = require('../models/companyModel');
-// ===== helper de id =====
-const oid = (v) => (typeof v === 'string' ? new ObjectId(v) : v);
 
-// ===== DEFAULT CHECKLIST (pode ajustar livremente) =====
+/* ========= default checklist ========= */
 function defaultComplianceChecklist() {
   return {
     habilitacaoJuridica: {
@@ -50,59 +48,7 @@ function defaultComplianceChecklist() {
   };
 }
 
-// ===== GET /api/company/my/checklist =====
-async function getComplianceChecklist(req, res) {
-  try {
-    const db = await getDb();
-    const comp = await db.collection('companies').findOne(
-      { _id: oid(req.companyId) },
-      { projection: { complianceChecklist: 1 } }
-    );
-
-    const checklist = comp?.complianceChecklist || defaultComplianceChecklist();
-    return res.json({ checklist });
-  } catch (e) {
-    console.error('getComplianceChecklist error:', e);
-    return res.status(500).json({ error: 'Falha ao carregar checklist.' });
-  }
-}
-
-// ===== PATCH /api/company/my/checklist =====
-// Somente owner/admin (o middleware de auth deve garantir role)
-async function updateComplianceChecklist(req, res) {
-  try {
-    const incoming = req.body?.checklist || {};
-    // sanity: só aceita boolean/string dentro das chaves conhecidas
-    const base = defaultComplianceChecklist();
-
-    // função recursiva de merge “seguro”
-    const mergeSafe = (dst, src) => {
-      for (const k of Object.keys(dst)) {
-        if (typeof dst[k] === 'object' && dst[k] !== null && !Array.isArray(dst[k])) {
-          if (src && typeof src[k] === 'object') mergeSafe(dst[k], src[k]);
-        } else if (typeof dst[k] === 'boolean') {
-          if (typeof src?.[k] === 'boolean') dst[k] = src[k];
-        } else if (typeof dst[k] === 'string') {
-          if (typeof src?.[k] === 'string') dst[k] = String(src[k]).slice(0, 5000);
-        }
-      }
-      return dst;
-    };
-
-    const sanitized = mergeSafe(base, incoming);
-
-    const db = await getDb();
-    await db.collection('companies').updateOne(
-      { _id: oid(req.companyId) },
-      { $set: { complianceChecklist: sanitized, updatedAt: new Date() } }
-    );
-
-    return res.json({ ok: true, checklist: sanitized });
-  } catch (e) {
-    console.error('updateComplianceChecklist error:', e);
-    return res.status(500).json({ error: 'Falha ao salvar checklist.' });
-  }
-}
+/* ========= helpers ========= */
 function sanitizeCompany(c) {
   if (!c) return null;
   const { _id, name, cnpj, contact, address, plan, createdBy, createdAt, updatedAt } = c;
@@ -119,12 +65,35 @@ function sanitizeCompany(c) {
   };
 }
 
+// merge seguro mantendo estrutura e tipos
+function mergeChecklist(base, incoming) {
+  const dst = JSON.parse(JSON.stringify(base));
+  const walk = (d, s) => {
+    Object.keys(d).forEach((k) => {
+      const dv = d[k];
+      const sv = s?.[k];
+      if (dv && typeof dv === 'object' && !Array.isArray(dv)) {
+        walk(dv, sv);
+      } else if (typeof dv === 'boolean') {
+        if (typeof sv === 'boolean') d[k] = sv;
+      } else if (typeof dv === 'string') {
+        if (typeof sv === 'string') d[k] = String(sv).slice(0, 5000);
+      }
+    });
+  };
+  walk(dst, incoming || {});
+  return dst;
+}
+
+/* ========= company: get/update ========= */
 async function getMyCompany(req, res) {
   try {
     const { companyId } = req.auth || {};
     if (!companyId) return res.status(404).json({ error: 'Usuário não possui empresa vinculada.' });
+
     const company = await Companies.findById(companyId);
     if (!company) return res.status(404).json({ error: 'Empresa não encontrada.' });
+
     return res.json({ company: sanitizeCompany(company) });
   } catch (e) {
     console.error('getMyCompany error:', e);
@@ -152,4 +121,57 @@ async function updateMyCompany(req, res) {
   }
 }
 
-module.exports = { getMyCompany, updateMyCompany };
+/* ========= checklist: get/update ========= */
+async function getComplianceChecklist(req, res) {
+  try {
+    const { companyId } = req.auth || {};
+    if (!companyId) return res.status(404).json({ error: 'Usuário não possui empresa vinculada.' });
+
+    const company = await Companies.findById(companyId);
+    const checklist = company?.complianceChecklist || defaultComplianceChecklist();
+
+    // opcional: persiste default se não existir ainda
+    if (!company?.complianceChecklist) {
+      try {
+        await Companies.updateById(companyId, {
+          complianceChecklist: checklist,
+          updatedAt: new Date()
+        });
+      } catch (_) {}
+    }
+
+    return res.json({ checklist });
+  } catch (e) {
+    console.error('getComplianceChecklist error:', e);
+    return res.status(500).json({ error: 'Falha ao carregar checklist.' });
+  }
+}
+
+async function updateComplianceChecklist(req, res) {
+  try {
+    const { companyId } = req.auth || {};
+    if (!companyId) return res.status(404).json({ error: 'Usuário não possui empresa vinculada.' });
+
+    const incoming = req.body?.checklist || {};
+    const base = defaultComplianceChecklist();
+    const sanitized = mergeChecklist(base, incoming);
+
+    const updated = await Companies.updateById(companyId, {
+      complianceChecklist: sanitized,
+      updatedAt: new Date()
+    });
+
+    const out = updated?.complianceChecklist || sanitized;
+    return res.json({ ok: true, checklist: out });
+  } catch (e) {
+    console.error('updateComplianceChecklist error:', e);
+    return res.status(500).json({ error: 'Falha ao salvar checklist.' });
+  }
+}
+
+module.exports = {
+  getMyCompany,
+  updateMyCompany,
+  getComplianceChecklist,
+  updateComplianceChecklist,
+};

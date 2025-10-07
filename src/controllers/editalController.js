@@ -25,8 +25,18 @@ const {
   hasDomainOverlap
 } = require('../services/cats');
 
-/* ============ Diretório de relatórios ============ */
-const REPORTS_DIR = path.resolve(process.cwd(), 'data', 'reports');
+/* ========= multi-tenant helpers ========= */
+const DATA_ROOT = path.resolve(process.cwd(), 'data');
+function getReportsDir(companyId) {
+  // tenant: data/tenants/<companyId>/reports ; fallback: data/reports
+  return companyId
+    ? path.join(DATA_ROOT, 'tenants', String(companyId), 'reports')
+    : path.join(DATA_ROOT, 'reports');
+}
+function getTenantId(req) {
+  // tenta auth.companyId, depois req.companyId (caso seu middleware coloque lá)
+  return (req.auth && req.auth.companyId) || req.companyId || null;
+}
 
 /* ============ Helpers de formatação/parse ============ */
 function normalizeField(v) {
@@ -96,7 +106,7 @@ function parseBidHeader(editalText = '') {
   };
 }
 
-/* ============ PDF helpers ============ */
+/* ============ PDF helpers (keep-together) ============ */
 function cleanTextForPdf(text = '') {
   return String(text || '')
     .replace(/<[^>]+>/g, '')
@@ -106,14 +116,7 @@ function cleanTextForPdf(text = '') {
     .trim();
 }
 
-/** ====== Parser de blocos (para "keep-together") ======
- * Tipos:
- * - heading:  #, ##, ###
- * - badge:    inicia com 🟢/🟡/🔴
- * - listItem: item "- ..." e subitens "  - ..." unidos como um bloco
- * - paragraph: parágrafo comum
- * - spacer: linha vazia
- */
+/** Parser de blocos para keep-together */
 function chunkMarkdownToBlocks(md) {
   const rawLines = cleanTextForPdf(md).split('\n');
   const blocks = [];
@@ -129,35 +132,17 @@ function chunkMarkdownToBlocks(md) {
   while (i < rawLines.length) {
     const line = rawLines[i];
 
-    if (isBlank(line)) {
-      blocks.push({ type: 'spacer', lines: [''] });
-      i += 1;
-      continue;
-    }
-
-    if (isHeading(line)) {
-      blocks.push({ type: 'heading', level: headingLevel(line), lines: [line.replace(/^#{1,3}\s+/, '')] });
-      i += 1;
-      continue;
-    }
-
-    if (isBadge(line)) {
-      blocks.push({ type: 'badge', lines: [line] });
-      i += 1;
-      continue;
-    }
+    if (isBlank(line)) { blocks.push({ type: 'spacer', lines: [''] }); i += 1; continue; }
+    if (isHeading(line)) { blocks.push({ type: 'heading', level: headingLevel(line), lines: [line.replace(/^#{1,3}\s+/, '')] }); i += 1; continue; }
+    if (isBadge(line)) { blocks.push({ type: 'badge', lines: [line] }); i += 1; continue; }
 
     if (isTopBullet(line)) {
-      // junta este item + subitens imediatamente seguintes
       const lines = [line];
       let j = i + 1;
       while (j < rawLines.length) {
         if (isSubBullet(rawLines[j])) { lines.push(rawLines[j]); j++; continue; }
-        // se vier outro top-level bullet imediatamente, encerra bloco atual
         if (isTopBullet(rawLines[j])) break;
-        // se vier linha vazia, encerra bloco
         if (isBlank(rawLines[j]) || isHeading(rawLines[j]) || isBadge(rawLines[j])) break;
-        // se vier parágrafo, também termina (mantemos como bloco separado)
         break;
       }
       blocks.push({ type: 'listItem', lines });
@@ -165,13 +150,11 @@ function chunkMarkdownToBlocks(md) {
       continue;
     }
 
-    // parágrafo: consome até linha vazia ou heading/badge/list
     const lines = [line];
     let j = i + 1;
     while (j < rawLines.length) {
       if (isBlank(rawLines[j]) || isHeading(rawLines[j]) || isBadge(rawLines[j]) || isTopBullet(rawLines[j]) || isSubBullet(rawLines[j])) break;
-      lines.push(rawLines[j]);
-      j++;
+      lines.push(rawLines[j]); j++;
     }
     blocks.push({ type: 'paragraph', lines });
     i = j;
@@ -180,46 +163,37 @@ function chunkMarkdownToBlocks(md) {
   return blocks;
 }
 
-/* ========== Render com "keep-together" por bloco ========== */
 function renderBlocksKeepTogether(doc, md, width) {
   const blocks = chunkMarkdownToBlocks(md);
-
   const LINE_GAP = 2;
   const TOP_INDENT = 8;
   const SUB_INDENT = 18;
 
-  // util: espaço restante na página
   const spaceLeft = () => doc.page.height - doc.page.margins.bottom - doc.y;
 
-  // mede altura aproximada do bloco usando heightOfString
   const measureBlock = (b) => {
-    doc.font('Helvetica').fontSize(11); // padrão
+    doc.font('Helvetica').fontSize(11);
     switch (b.type) {
-      case 'spacer':
-        return 6;
+      case 'spacer': return 6;
       case 'heading': {
         const size = b.level === 1 ? 16 : (b.level === 2 ? 13 : 12);
-        doc.font(b.level === 1 ? 'Helvetica-Bold' : 'Helvetica-Bold').fontSize(size);
+        doc.font('Helvetica-Bold').fontSize(size);
         const h = doc.heightOfString(b.lines.join('\n'), { width, lineGap: LINE_GAP });
         doc.font('Helvetica').fontSize(11);
         return h + 4;
       }
       case 'badge': {
-        // texto com margem para bolinha
         const text = b.lines.join('\n').replace(/^[^\s]+\s*/, '');
         const h = doc.heightOfString(text, { width: width - 12, lineGap: LINE_GAP });
-        return h + 10; // 10px para a bolinha e respiro
+        return h + 10;
       }
       case 'listItem': {
         let h = 0;
         for (const ln of b.lines) {
-          if (/^-\s+/.test(ln)) {
-            const t = '• ' + ln.replace(/^-\s+/, '');
-            h += doc.heightOfString(t, { width, lineGap: LINE_GAP });
-          } else {
-            const t = '• ' + ln.replace(/^ {2,}-\s+/, '');
-            h += doc.heightOfString(t, { width: width - SUB_INDENT, lineGap: LINE_GAP });
-          }
+          const t = /^-\s+/.test(ln)
+            ? '• ' + ln.replace(/^-\s+/, '')
+            : '• ' + ln.replace(/^ {2,}-\s+/, '');
+          h += doc.heightOfString(t, { width: /^-\s+/.test(ln) ? width : (width - SUB_INDENT), lineGap: LINE_GAP });
         }
         return h + 4;
       }
@@ -232,24 +206,19 @@ function renderBlocksKeepTogether(doc, md, width) {
     }
   };
 
-  // escreve bloco (sabendo que cabe)
   const renderBlock = (b) => {
     doc.fillColor('#000').font('Helvetica').fontSize(11);
-
     switch (b.type) {
       case 'spacer':
-        doc.moveDown(0.35);
-        return;
-
+        doc.moveDown(0.35); return;
       case 'heading': {
         const size = b.level === 1 ? 16 : (b.level === 2 ? 13 : 12);
         doc.font('Helvetica-Bold').fontSize(size);
-        doc.text(b.lines.join('\n'), { width, align: 'left', lineGap: LINE_GAP });
+        doc.text(b.lines.join('\n'), { width, align: 'left', lineGap: 2 });
         doc.font('Helvetica').fontSize(11);
         if (b.level === 1) doc.moveDown(0.15);
         return;
       }
-
       case 'badge': {
         const raw = b.lines[0] || '';
         const color = raw.startsWith('🟢') ? '#22c55e' : raw.startsWith('🟡') ? '#f59e0b' : '#ef4444';
@@ -257,35 +226,32 @@ function renderBlocksKeepTogether(doc, md, width) {
         const x = doc.x, y = doc.y + 5;
         doc.save().circle(x + 4, y, 4).fill(color).restore();
         doc.fillColor('#000');
-        doc.text(text, x + 12, doc.y, { width: width - 12, align: 'left', lineGap: LINE_GAP });
+        doc.text(text, x + 12, doc.y, { width: width - 12, align: 'left', lineGap: 2 });
         doc.fillColor('#000');
         return;
       }
-
       case 'listItem': {
         for (const ln of b.lines) {
           if (/^-\s+/.test(ln)) {
             const t = '• ' + ln.replace(/^-\s+/, '');
-            doc.text(t, { width, align: 'left', lineGap: LINE_GAP, indent: TOP_INDENT });
+            doc.text(t, { width, align: 'left', lineGap: 2, indent: TOP_INDENT });
           } else {
             const t = '• ' + ln.replace(/^ {2,}-\s+/, '');
             const x = doc.x + SUB_INDENT;
             const y = doc.y;
-            doc.text(t, x, y, { width: width - SUB_INDENT, align: 'left', lineGap: LINE_GAP });
+            doc.text(t, x, y, { width: width - SUB_INDENT, align: 'left', lineGap: 2 });
           }
         }
         return;
       }
-
       case 'paragraph': {
-        // negrito inline simples **...**
         const line = b.lines.join('\n');
         const parts = line.split(/\*\*(.+?)\*\*/g);
         for (let i = 0; i < parts.length; i++) {
           const chunk = parts[i];
           if (!chunk) continue;
           doc.font(i % 2 ? 'Helvetica-Bold' : 'Helvetica');
-          doc.text(chunk, { width, continued: i < parts.length - 1, lineGap: LINE_GAP });
+          doc.text(chunk, { width, continued: i < parts.length - 1, lineGap: 2 });
         }
         doc.text('');
         return;
@@ -300,20 +266,18 @@ function renderBlocksKeepTogether(doc, md, width) {
   }
 }
 
-/* quebra “Análise Detalhada” em nova página */
 function renderMdWithLogicalBreak(doc, md, width) {
   const SPLIT = '\n## Análise Detalhada';
-  if (!md.includes(SPLIT)) {
-    renderBlocksKeepTogether(doc, md, width);
-    return;
-  }
+  if (!md.includes(SPLIT)) { renderBlocksKeepTogether(doc, md, width); return; }
   const [a, b] = md.split(SPLIT);
   renderBlocksKeepTogether(doc, a, width);
   doc.addPage();
   renderBlocksKeepTogether(doc, '## Análise Detalhada' + b, width);
 }
 
-async function gerarPdf(markdown) {
+/* ========= gerarPdf multi-tenant ========= */
+async function gerarPdf(markdown, companyId = null) {
+  const REPORTS_DIR = getReportsDir(companyId);
   await fsp.mkdir(REPORTS_DIR, { recursive: true });
   const filename = `relatorio_viabilidade_${Date.now()}.pdf`;
   const outPath = path.join(REPORTS_DIR, filename);
@@ -324,30 +288,29 @@ async function gerarPdf(markdown) {
 
   const contentWidth = doc.page.width - doc.page.margins.left - doc.page.margins.right;
 
-  // reset a cada página
   doc.on('pageAdded', () => {
     doc.font('Helvetica').fontSize(11).fillColor('#000');
   });
 
-  // Título
   doc.font('Helvetica-Bold').fontSize(16)
      .text('RELATÓRIO DE VIABILIDADE', { align: 'center', width: contentWidth, lineGap: 2 });
   doc.moveDown(0.4);
 
-  // Corpo
   doc.font('Helvetica').fontSize(11).fillColor('#000');
   renderMdWithLogicalBreak(doc, markdown || '-', contentWidth);
 
   doc.end();
 
-  return new Promise((resolve, reject) => {
-    stream.on('finish', () => resolve({
-      filePath: outPath,
-      publicUrl: `/api/edital/report/${filename}`,
-      filename
-    }));
+  await new Promise((resolve, reject) => {
+    stream.on('finish', resolve);
     stream.on('error', reject);
   });
+
+  return {
+    filePath: outPath,
+    publicUrl: `/api/edital/report/${filename}`,
+    filename
+  };
 }
 
 /* ============ PROGRESS LOGGER ============ */
@@ -369,7 +332,7 @@ function makeProgressLogger() {
   return { bump, phase, sub, get, log, WEIGHTS };
 }
 
-/* ======= indicador ponderado (técnico 60% / documental 40%) ======= */
+/* ======= indicador ponderado ======= */
 function parseStatusFromText(block = '') {
   const t = (block || '').toLowerCase();
   if (/não atendido|nao atendido|🔴/i.test(t)) return 'NAO';
@@ -405,13 +368,13 @@ function recomendacaoByPct(pct) {
   return { label: '🔴 PARTICIPAÇÃO NÃO RECOMENDADA', cor: 'vermelho' };
 }
 
-/* ===== regex amplo para reconhecer requisitos TÉCNICOS ===== */
 const TECH_REQ_RX =
   /\b(cat(?:s)?|capacidade\s+t[eé]cnica|capacit[aã]o\s+t[eé]cnica|atestado(?:s)?\s+de?\s+capacidade|acervo\s+t[eé]cnico|experi[êe]ncia(?:\s+t[eé]cnica)?|respons[aá]vel\s+t[eé]cnico|(?:\b|^)RT\b)\b/i;
 
-/* ============ CONTROLLER principal ============ */
+/* ============ CONTROLLER principal (multi-empresa) ============ */
 async function analisarEdital(req, res) {
   const PROGRESS = makeProgressLogger();
+  const tenantId = getTenantId(req);
 
   if (!req.files || !req.files.editalPdf || req.files.editalPdf.length !== 1) {
     return res.status(400).json({ error: 'Envie exatamente 1 arquivo PDF do edital (campo: editalPdf).' });
@@ -420,7 +383,7 @@ async function analisarEdital(req, res) {
   const mainEditalFile = req.files.editalPdf[0];
   const annexFiles = req.files['arquivos[]'] || [];
   console.log(`\n-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=`);
-  console.log(`[${new Date().toLocaleString('pt-BR')}] Nova análise: ${mainEditalFile.originalname} (+${annexFiles.length} anexos)`);
+  console.log(`[${new Date().toLocaleString('pt-BR')}] Nova análise: ${mainEditalFile.originalname} (+${annexFiles.length} anexos) | tenant=${tenantId || 'public'}`);
 
   // Mongo opcional
   let catsCol = null, chunksCol = null;
@@ -471,7 +434,7 @@ async function analisarEdital(req, res) {
       }
     }
 
-    // CATs combinadas
+    // CATs combinadas (multi-tenant filter via opts.tenantId)
     let totalCandidatesEstimate = 1;
     const catSearchTick = PROGRESS.sub('CAT_SEARCH', () => totalCandidatesEstimate);
     const allCatsRaw = await findCATMatches(
@@ -480,6 +443,7 @@ async function analisarEdital(req, res) {
       8,
       localFilesText,
       {
+        tenantId,  // <<<<<<<<<<<<<<<<<<<<< multi-empresa
         debug: (evt) => {
           try {
             if (evt.kind === 'mongoBatchCats') { totalCandidatesEstimate += Math.max(0, evt.total); }
@@ -554,7 +518,7 @@ async function analisarEdital(req, res) {
       reqTick(i + 1, 'análise por evidências');
     }
 
-    // Indicadores ponderados (60/40)
+    // Indicadores ponderados
     const indic = computeWeightedIndicators(results);
     const rec = recomendacaoByPct(indic.pct);
 
@@ -615,7 +579,6 @@ async function analisarEdital(req, res) {
       PROGRESS.phase('SUMMARY', 'Falha ao gerar sumário (continuando)');
     }
 
-    // Patch dos indicadores dentro do bloco "Recomendação Final"
     const summaryPatched = summary.replace(
       /###\s*Recomendação Final[\s\S]*?(?=\n###|\n##|$)/i,
       (m) => {
@@ -625,7 +588,6 @@ async function analisarEdital(req, res) {
       }
     );
 
-    // Cabeçalho (lista)
     const headerList = [
       `- **Órgão Licitório:** ${header.orgaoLicitante || '-'}`,
       `- **Concorrência Eletrônica:** ${header.concorrenciaEletronica || '-'}`,
@@ -636,7 +598,6 @@ async function analisarEdital(req, res) {
       `- **Prazo máximo para proposta:** ${header.prazoMaximoParaProposta || '-'}`,
     ].join('\n');
 
-    // Relatório final
     const finalReport = [
       '# RELATÓRIO DE VIABILIDADE',
       '## Dados do edital',
@@ -647,14 +608,14 @@ async function analisarEdital(req, res) {
       blocoViabilidade,
       blocoRT ? `\n${blocoRT}` : '',
       '',
-      // o sumário já pode trazer "## Sumário Executivo" do service; mantemos
+      '## Sumário Executivo',
       summaryPatched,
       '',
       '## Análise Detalhada',
       analysesMd.join('\n\n') || '- (Não foi possível gerar a análise detalhada)'
     ].join('\n\n');
 
-    const { publicUrl, filePath, filename } = await gerarPdf(finalReport);
+    const { publicUrl, filePath, filename } = await gerarPdf(finalReport, tenantId);
     PROGRESS.phase('PDF', `PDF emitido em ${filePath}`);
     console.log(` -> Análise concluída! Progresso final: ${PROGRESS.get().toFixed(1)}%`);
     return res.json({ report: finalReport, pdf: { filename, url: publicUrl, path: filePath } });
@@ -679,7 +640,8 @@ async function gerarPdfFromBody(req, res) {
     if (!reportMd || typeof reportMd !== 'string' || reportMd.trim().length < 5) {
       return res.status(400).json({ error: 'Campo "reportMd" é obrigatório (string com conteúdo).' });
     }
-    const { publicUrl, filename } = await gerarPdf(reportMd);
+    const tenantId = getTenantId(req);
+    const { publicUrl, filename } = await gerarPdf(reportMd, tenantId);
     return res.json({ url: publicUrl, filename });
   } catch (e) {
     console.error('[gerarPdfFromBody] ERRO:', e);
@@ -687,14 +649,17 @@ async function gerarPdfFromBody(req, res) {
   }
 }
 
-/** GET /api/edital/analisar/history */
+/** GET /api/edital/analisar/history (scoped ao tenant) */
 async function listarHistorico(req, res) {
   try {
+    const tenantId = getTenantId(req);
+    const REPORTS_DIR = getReportsDir(tenantId);
+
     const page = Math.max(1, parseInt(req.query.page || '1', 10));
     const pageSize = Math.min(50, Math.max(1, parseInt(req.query.pageSize || '10', 10)));
 
-    await fsp.mkdir(REPORTS_DIR, { recursive: true });
-    const files = await fsp.readdir(REPORTS_DIR);
+    await fsp.mkdir(REPORTS_DIR, { recursive: true }).catch(() => {});
+    const files = await fsp.readdir(REPORTS_DIR).catch(() => []);
     const pdfFiles = files.filter(f => f.toLowerCase().endsWith('.pdf'));
 
     const entries = await Promise.all(pdfFiles.map(async (name) => {
@@ -723,9 +688,12 @@ async function listarHistorico(req, res) {
   }
 }
 
-/** GET /api/edital/report/:name */
+/** GET /api/edital/report/:name (scoped ao tenant) */
 async function serveReportByName(req, res) {
   try {
+    const tenantId = getTenantId(req);
+    const REPORTS_DIR = getReportsDir(tenantId);
+
     const raw = req.params.name || '';
     if (!raw || raw.includes('..') || raw.includes('/') || raw.includes('\\')) {
       return res.status(400).send('Nome de arquivo inválido');
@@ -748,4 +716,5 @@ module.exports = {
   gerarPdfFromBody,
   listarHistorico,
   serveReportByName,
+  __getParseHeader: parseBidHeader, // <= para o Core reaproveitar quando quiser
 };

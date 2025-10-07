@@ -33,11 +33,23 @@ const { AZ_KEY, AZ_ENDPOINT, AZ_VER } = require('./Config/env');
 const upload = multer({ dest: 'uploads/' });
 const distIndex = path.join(process.cwd(), 'dist', 'index.html');
 const app = express();
-app.use(cors({
-  origin: true,         // reflete o Origin do request
-  credentials: false,   // não precisamos de cookies
-  exposedHeaders: ['Content-Disposition']
-}));
+// CORS liberado para qualquer origem (ecoando a origin)
+// e aceitando credenciais quando houver.
+const openCors = {
+  origin: true,              // <- reflete a Origin recebida (libera "tudo")
+  credentials: true,         // <- permite cookies/aut headers cross-site
+  methods: ['GET','HEAD','POST','PUT','PATCH','DELETE','OPTIONS'],
+  allowedHeaders: ['Content-Type','Authorization','X-Requested-With'],
+  exposedHeaders: ['Content-Disposition'], // útil p/ download de arquivos
+};
+
+app.use((req, res, next) => {
+  res.header('Vary', 'Origin'); // bom p/ caches/proxy
+  next();
+});
+
+app.use(cors(openCors));
+app.options('*', cors(openCors)); // responde preflight rapidamente
 app.use(express.json({limit: '10mb'}));
 
 // Rotas de API

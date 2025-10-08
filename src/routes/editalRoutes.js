@@ -82,14 +82,11 @@ router.post(
 router.get('/analisar/status/:id', auth, (req, res) => {
   const job = getJob(req.params.id);
   if (!job) return res.status(404).json({ error: 'Job não encontrado.' });
-
-  // multi-tenant guard
   if (job.meta?.companyId && job.meta.companyId !== (req.companyId || req.auth?.companyId)) {
     return res.status(403).json({ error: 'Forbidden' });
   }
-
-  const { id, status, pct, phase, startedAt, finishedAt, meta } = job;
-  res.json({ id, status, pct, phase, startedAt, finishedAt, meta });
+  const { id, status, pct, phase, startedAt, finishedAt, meta, error } = job;
+  res.json({ id, status, pct, phase, startedAt, finishedAt, meta, error });
 });
 
 // STREAM (SSE) — aceita token via query (?token=JWT) porque EventSource não envia headers

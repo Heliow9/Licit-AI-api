@@ -11,7 +11,11 @@ const {
   extractRequirementsFromBid,
   analyzeSingleRequirement,
   generateExecutiveSummary,
-  findEvidenceOnTheFly
+  findEvidenceOnTheFly,
+  // === novos helpers vindos do services/evidence ===
+  countEliminatoryFailures,
+  computeSuccessProbability,
+  renderSuccessBanner,
 } = require('../services/evidence');
 
 const {
@@ -332,7 +336,7 @@ function makeProgressLogger() {
   return { bump, phase, sub, get, log, WEIGHTS };
 }
 
-/* ======= indicador ponderado ======= */
+/* ======= indicador ponderado (70/30) ======= */
 function parseStatusFromText(block = '') {
   const t = (block || '').toLowerCase();
   if (/não atendido|nao atendido|🔴/i.test(t)) return 'NAO';
@@ -342,7 +346,7 @@ function parseStatusFromText(block = '') {
 }
 function computeWeightedIndicators(items) {
   const tech = items.filter(i => i.kind === 'TECH');
-  const doc  = items.filter(i => i.kind === 'DOC');
+  const doc  = items.filter(i => i.kind === 'DOC'); // documental/administrativo
   const count = (arr, st) => arr.filter(i => i.status === st).length;
 
   const okT = count(tech, 'OK'), paT = count(tech, 'PARCIAL'), naT = count(tech, 'NAO');
@@ -352,12 +356,13 @@ function computeWeightedIndicators(items) {
   const techScore = score(okT, paT, tech.length);
   const docScore  = score(okD, paD, doc.length);
 
-  const finalPct = Math.round((0.6 * techScore + 0.4 * docScore) * 100);
+  // >>> AJUSTE: 70% técnica / 30% documental
+  const finalPct = Math.round((0.7 * techScore + 0.3 * docScore) * 100);
 
   return {
     counts: { ok: okT + okD, parcial: paT + paD, nao: naT + naD },
-    tech:   { ok: okT, parcial: paT, nao: naT, pct: Math.round(techScore * 100) },
-    doc:    { ok: okD, parcial: paD, nao: naD, pct: Math.round(docScore * 100) },
+    tech:   { ok: okT, parcial: paT, nao: naT, pct: Math.round(techScore * 100), score: techScore },
+    doc:    { ok: okD, parcial: paD, nao: naD, pct: Math.round(docScore * 100), score: docScore },
     pct: finalPct
   };
 }
@@ -368,6 +373,7 @@ function recomendacaoByPct(pct) {
   return { label: '🔴 PARTICIPAÇÃO NÃO RECOMENDADA', cor: 'vermelho' };
 }
 
+// Regex técnica local ao controller (para identificar requisitos técnicos rapidamente)
 const TECH_REQ_RX =
   /\b(cat(?:s)?|capacidade\s+t[eé]cnica|capacit[aã]o\s+t[eé]cnica|atestado(?:s)?\s+de?\s+capacidade|acervo\s+t[eé]cnico|experi[êe]ncia(?:\s+t[eé]cnica)?|respons[aá]vel\s+t[eé]cnico|(?:\b|^)RT\b)\b/i;
 
@@ -518,16 +524,21 @@ async function analisarEdital(req, res) {
       reqTick(i + 1, 'análise por evidências');
     }
 
-    // Indicadores ponderados
+    // Indicadores ponderados (70/30)
     const indic = computeWeightedIndicators(results);
     const rec = recomendacaoByPct(indic.pct);
+
+    // Probabilidade de êxito (usa scores 0..1 e penaliza eliminatório não atendido)
+    const eliminatoriosNaoAt = countEliminatoryFailures(analysesMd); // analisa blocos textuais
+    const probExito = computeSuccessProbability(indic.tech.score, indic.doc.score, eliminatoriosNaoAt);
+    const probBanner = renderSuccessBanner(probExito, eliminatoriosNaoAt);
 
     const indicadoresMd = [
       `### Resultado ponderado`,
       `**Recomendação:** ${rec.label}`,
-      `**Indicadores gerais:** ${indic.counts.ok} OK • ${indic.counts.parcial} PARCIAL • ${indic.counts.nao} NÃO • **Atendimento global (ponderado): ${indic.pct}%**`,
-      `**Técnico (60%):** ${indic.tech.ok} OK • ${indic.tech.parcial} PARCIAL • ${indic.tech.nao} NÃO — ${indic.tech.pct}%`,
-      `**Documental (40%):** ${indic.doc.ok} OK • ${indic.doc.parcial} PARCIAL • ${indic.doc.nao} NÃO — ${indic.doc.pct}%`,
+      `**Indicadores gerais:** ${indic.counts.ok} OK • ${indic.counts.parcial} PARCIAL • ${indic.counts.nao} NÃO • **Atendimento global (ponderado 70/30): ${indic.pct}%**`,
+      `**Técnico (70%):** ${indic.tech.ok} OK • ${indic.tech.parcial} PARCIAL • ${indic.tech.nao} NÃO — ${indic.tech.pct}%`,
+      `**Documental (30%):** ${indic.doc.ok} OK • ${indic.doc.parcial} PARCIAL • ${indic.doc.nao} NÃO — ${indic.doc.pct}%`,
     ].join('\n\n');
 
     // Bloco Viabilidade (CATs)
@@ -583,8 +594,8 @@ async function analisarEdital(req, res) {
       /###\s*Recomendação Final[\s\S]*?(?=\n###|\n##|$)/i,
       (m) => {
         const base = m.trim().replace(/\n+$/,'');
-        const extra = `\n\n**Indicadores (ponderado):** Técnico ${indic.tech.pct}% • Documental ${indic.doc.pct}% • **Global ${indic.pct}%**`;
-        return base.includes('Indicadores (ponderado):') ? base : base + extra;
+        const extra = `\n\n**Indicadores (ponderado 70/30):** Técnico ${indic.tech.pct}% • Documental ${indic.doc.pct}% • **Global ${indic.pct}%**`;
+        return base.includes('Indicadores (ponderado') ? base : base + extra;
       }
     );
 
@@ -598,8 +609,12 @@ async function analisarEdital(req, res) {
       `- **Prazo máximo para proposta:** ${header.prazoMaximoParaProposta || '-'}`,
     ].join('\n');
 
+    // >>> Banner de probabilidade no topo do relatório
+    const bannerTopo = probBanner; // já vem formatado em markdown
+
     const finalReport = [
       '# RELATÓRIO DE VIABILIDADE',
+      bannerTopo,                              // <<<<<<<<<<<<<<<< AQUI (topo)
       '## Dados do edital',
       headerList,
       '',
@@ -618,7 +633,11 @@ async function analisarEdital(req, res) {
     const { publicUrl, filePath, filename } = await gerarPdf(finalReport, tenantId);
     PROGRESS.phase('PDF', `PDF emitido em ${filePath}`);
     console.log(` -> Análise concluída! Progresso final: ${PROGRESS.get().toFixed(1)}%`);
-    return res.json({ report: finalReport, pdf: { filename, url: publicUrl, path: filePath } });
+    return res.json({
+      report: finalReport,
+      pdf: { filename, url: publicUrl, path: filePath },
+      probability: { value: Math.round(probExito * 100), eliminatoriosNaoAt }
+    });
 
   } catch (error) {
     console.error(' -> ❌ Erro:', error);

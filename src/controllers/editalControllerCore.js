@@ -1,11 +1,11 @@
-// src/controllers/editalControllerCore.js
 const fs = require('fs');
 const path = require('path');
+const PDFDocument = require('pdfkit');
+
 const { getDb } = require('../Config/db');
+const Companies = require('../models/companyModel');
 const { MAX_EDITALTEXT_CHARS } = require('../Config/env');
 const { extractTextFromPdf } = require('../utils/ocr');
-const PDFDocument = require('pdfkit');
-const Companies = require('../models/companyModel');
 
 const {
   extractRequirementsFromBid,
@@ -28,10 +28,11 @@ const {
   signaturesFor
 } = require('../services/cats');
 
+/* ====== diretório por empresa para salvar relatórios ====== */
 const REPORTS_BASE_DIR = path.join(process.cwd(), 'data', 'reports');
 const companyReportsDir = (companyId) => path.join(REPORTS_BASE_DIR, String(companyId || 'unknown'));
 
-/* ============================ HELPERS PDF ============================ */
+/* ============================ PDF helpers ============================ */
 function cleanTextForPdf(text = '') {
   const zwsp = '\u200B';
   return String(text)
@@ -41,27 +42,83 @@ function cleanTextForPdf(text = '') {
 }
 
 function renderMarkdownSimple(doc, markdown) {
-  const lines = cleanTextForPdf(markdown).split(/\r?\n/);
   const contentWidth = doc.page.width - doc.page.margins.left - doc.page.margins.right;
+  const raw = cleanTextForPdf(markdown || '');
+
+  const lines = raw
+    .replace(/\r/g, '')
+    .replace(/\t/g, ' ')
+    .replace(/[ \u00A0]+$/gm, '')
+    .replace(/^(\s*[-•]\s*)\*\*\s*/gm, '$1')
+    .split('\n');
 
   const drawHr = () => {
-    doc.moveDown(0.3);
+    doc.moveDown(0.35);
     const y = doc.y;
-    doc.moveTo(doc.page.margins.left, y).lineTo(doc.page.width - doc.page.margins.right, y)
-      .strokeColor('#e5e7eb').lineWidth(1).stroke();
-    doc.strokeColor('black').lineWidth(1);
-    doc.moveDown(0.3);
+    doc.save()
+      .lineWidth(0.8)
+      .strokeColor('#e5e7eb')
+      .moveTo(doc.page.margins.left, y)
+      .lineTo(doc.page.width - doc.page.margins.right, y)
+      .stroke()
+      .restore();
+    doc.moveDown(0.35);
   };
 
-  lines.forEach((ln) => {
-    if (/^\s*---\s*$/.test(ln)) { drawHr(); return; }
-    if (/^#\s+/.test(ln))  { doc.moveDown(0.3).font('Helvetica-Bold').fontSize(18).text(ln.replace(/^#\s+/, ''), { width: contentWidth }); doc.font('Helvetica').fontSize(11); return; }
-    if (/^##\s+/.test(ln)) { doc.moveDown(0.25).font('Helvetica-Bold').fontSize(14).text(ln.replace(/^##\s+/, ''), { width: contentWidth }); doc.font('Helvetica').fontSize(11); return; }
-    if (/^###\s+/.test(ln)) { doc.moveDown(0.2).font('Helvetica-Bold').fontSize(12).text(ln.replace(/^###\s+/, ''), { width: contentWidth }); doc.font('Helvetica').fontSize(11); return; }
-    if (/^\s*[-•]\s+/.test(ln)) { doc.text(`• ${ln.replace(/^\s*[-•]\s+/, '')}`, { width: contentWidth, indent: 10 }); return; }
-    if (/^\s*$/.test(ln)) { doc.moveDown(0.25); return; }
-    doc.text(ln, { width: contentWidth, align: 'justify' });
-  });
+  const writePara = (t) => {
+    doc.text(t, {
+      width: contentWidth,
+      align: 'justify',
+      lineGap: 2.6,
+      paragraphGap: 4.2
+    });
+  };
+
+  for (let i = 0; i < lines.length; i++) {
+    const ln = lines[i];
+
+    if (/\[\[PAGE_BREAK\]\]/.test(ln)) {
+      doc.addPage();
+      continue;
+    }
+    if (/^\s*---\s*$/.test(ln)) { drawHr(); continue; }
+    if (/^#\s+/.test(ln)) {
+      doc.font('Helvetica-Bold').fontSize(18).text(ln.replace(/^#\s+/, ''), { width: contentWidth });
+      doc.font('Helvetica').fontSize(11);
+      doc.moveDown(0.4);
+      continue;
+    }
+    if (/^##\s+/.test(ln)) {
+      doc.font('Helvetica-Bold').fontSize(14).text(ln.replace(/^##\s+/, ''), { width: contentWidth });
+      doc.font('Helvetica').fontSize(11);
+      doc.moveDown(0.25);
+      continue;
+    }
+    if (/^###\s+/.test(ln)) {
+      doc.font('Helvetica-Bold').fontSize(12).text(ln.replace(/^###\s+/, ''), { width: contentWidth });
+      doc.font('Helvetica').fontSize(11);
+      doc.moveDown(0.15);
+      continue;
+    }
+
+    const bulletMatch = ln.match(/^\s*[-•]\s+(.*)$/);
+    if (bulletMatch) {
+      doc.list([bulletMatch[1]], {
+        bulletRadius: 1.8,
+        textIndent: 10,
+        bulletIndent: 14,
+        width: contentWidth
+      });
+      continue;
+    }
+
+    if (/^\s*$/.test(ln)) {
+      doc.moveDown(0.15);
+      continue;
+    }
+
+    writePara(ln);
+  }
 }
 
 async function gerarPdf(markdown, companyId) {
@@ -74,13 +131,12 @@ async function gerarPdf(markdown, companyId) {
   const stream = fs.createWriteStream(outPath);
   doc.pipe(stream);
 
-  // capa
   doc.font('Helvetica-Bold').fontSize(16).text('RELATÓRIO DE VIABILIDADE', { align: 'center' });
-  doc.moveDown(0.5);
+  doc.moveDown(0.35);
   doc.font('Helvetica').fontSize(10).fillColor('#6b7280')
     .text(`Emitido em: ${new Date().toLocaleString('pt-BR')}`, { align: 'center' })
     .fillColor('black');
-  doc.moveDown();
+  doc.moveDown(0.6);
 
   renderMarkdownSimple(doc, markdown);
 
@@ -90,8 +146,31 @@ async function gerarPdf(markdown, companyId) {
     stream.on('error', reject);
   });
 
-  // importante: rota autenticada que serve por empresa
   return { filePath: outPath, publicUrl: `/api/edital/report/${filename}`, filename };
+}
+
+/* ===================== helper de ranking por lote ===================== */
+async function rankCatsFor(textoAlvo, opts) {
+  const { catsCol, chunksCol, localFilesText, companyId } = opts;
+  const raw = await findCATMatches(
+    (catsCol || chunksCol) ? { catsCol, chunksCol } : null,
+    textoAlvo,
+    10,
+    localFilesText,
+    { companyId }
+  );
+
+  const dedup = uniqueByCat(raw).map(c => ({
+    ...c,
+    ano: pickReasonableYear(c.raw) || c.ano || ''
+  }));
+
+  const ranked = dedup.map(c => ({
+    meta: c,
+    score: scoreCatToObjetoLote(c, textoAlvo, '')
+  })).sort((a, b) => b.score - a.score);
+
+  return ranked.slice(0, 3);
 }
 
 /* ============================ CORE ============================ */
@@ -99,90 +178,93 @@ async function analisarEditalCore(files, onProgress = () => {}, opts = {}) {
   const { companyId } = opts || {};
   const bump = (pct, phase) => { try { onProgress(pct, phase); } catch {} };
 
-  // Mongo (chunks vetoriais)
-  let collection = null;
+  // Mongo (acesso a cats + chunks)
+  let catsCol = null;
+  let chunksCol = null;
   try {
     const db = await getDb();
-    collection = db.collection('chunks');
+    catsCol = db.collection('cats');     // <- CATs completas
+    chunksCol = db.collection('chunks'); // <- OCR/embeddings
   } catch {}
 
-  // Perfil da empresa (ADMIN)
+  // Perfil empresa
   let companyProfile = null;
   if (companyId) {
     try {
-      const c = await Companies.findById(companyId);
-      companyProfile = c ? c : null;
-    } catch (_) {}
+      companyProfile = await Companies.findById(companyId);
+    } catch {}
   }
 
   const mainEditalFile = files.mainEditalFile;
   const annexFiles = files.annexFiles || [];
-  const allUploadedFiles = [mainEditalFile, ...annexFiles];
+  const allFiles = [mainEditalFile, ...annexFiles];
 
   try {
-    // OCR principal
     const rawPdf = fs.readFileSync(mainEditalFile.path);
-    const mainEditalText = await extractTextFromPdf(rawPdf, mainEditalFile.path);
-    if (!mainEditalText?.trim()) {
-      throw new Error('Não foi possível extrair texto do PDF principal.');
-    }
-    const editalText = mainEditalText.slice(0, MAX_EDITALTEXT_CHARS || 200000);
+    const mainText = await extractTextFromPdf(rawPdf, mainEditalFile.path);
+    if (!mainText?.trim()) throw new Error('Falha ao extrair texto do edital.');
+    const editalText = mainText.slice(0, MAX_EDITALTEXT_CHARS || 200000);
     bump(15, 'OCR do edital');
 
-    // textos locais (para evidência)
-    const filesForEvidenceSearch = await Promise.all(
-      allUploadedFiles.map(async (file) => ({
-        source: file.originalname,
-        getText: async () => extractTextFromPdf(fs.readFileSync(file.path), file.path)
-      }))
-    );
-
+    // arquivos locais para evidências
     const localFilesText = [];
-    for (let i = 0; i < filesForEvidenceSearch.length; i++) {
+    for (const f of allFiles) {
       try {
-        const txt = await filesForEvidenceSearch[i].getText();
-        localFilesText.push({ source: filesForEvidenceSearch[i].source, text: txt || '' });
+        const txt = await extractTextFromPdf(fs.readFileSync(f.path), f.path);
+        localFilesText.push({ source: f.originalname, text: txt || '' });
       } catch {}
     }
     bump(25, 'Textos locais prontos');
 
-    // cabeçalho essencial
-    const header = (() => {
-      const api = require('../controllers/editalController');
-      if (api.__getParseHeader) return api.__getParseHeader(editalText);
-      return { objetoLicitado: (editalText.match(/OBJETO[\s\S]{0,800}/i)?.[0] || '').slice(0, 800) };
+    // header simplificado
+    const T = editalText;
+    const take = (rx, max = 1200) => (T.match(rx) ? String(T.match(rx)[0]).slice(0, max) : '');
+    const objetoBlock = take(/(?:\bDO?\s+OBJETO\b[\s\S]{0,2000})|(?:\bOBJETO\b[\s\S]{0,2000})/i, 2000);
+
+    const lotesSnippet = (() => {
+      const lotes = [];
+      const rx = /(?:^|\n)\s*(?:LOTE|Lote)\s*(\d+)\s*[:\-–]\s*([\s\S]{0,300})/gi;
+      let m; let cap = 0;
+      while ((m = rx.exec(T)) && cap < 6) {
+        lotes.push(`Lote ${m[1]}: ${m[2].trim().replace(/\s+/g, ' ')}`);
+        cap++;
+      }
+      return lotes.join('\n');
     })();
-    signaturesFor(header.objetoLicitado || editalText);
+
+    const header = {
+      objetoLicitado: (objetoBlock || '').trim() || T.slice(0, 2000),
+      resumoLotes: lotesSnippet
+    };
     bump(30, 'Cabeçalho extraído');
 
-    // CATs (Mongo + locais)
+    /* ========== Busca global de CATs (objeto + lotes) ========== */
+    const domainProbe = [header.objetoLicitado, header.resumoLotes].filter(Boolean).join('\n') || editalText;
+
     const allCatsRaw = await findCATMatches(
-      collection ? { chunksCol: collection } : null,
-      header.objetoLicitado || editalText,
-      10,
+      (catsCol || chunksCol) ? { catsCol, chunksCol } : null,
+      domainProbe,
+      15,
       localFilesText,
       { companyId }
     );
 
-    const dedupCats = uniqueByCat(allCatsRaw).map(c => ({ ...c, ano: pickReasonableYear(c.raw) || c.ano || '' }));
+    const dedupCats = uniqueByCat(allCatsRaw).map(c => ({
+      ...c,
+      ano: pickReasonableYear(c.raw) || c.ano || ''
+    }));
 
-    const ranked = dedupCats.map(c => ({
+    const objetoBase = [header.objetoLicitado, header.resumoLotes].filter(Boolean).join('\n') || editalText;
+    const preRank = dedupCats.map(c => ({
       meta: c,
-      score: scoreCatToObjetoLote(
-        c,
-        header.objetoLicitado || editalText,
-        ((header.concorrenciaEletronica || '') + '\n' + (header.tipo || ''))
-      )
-    })).sort((a, b) => b.score - a.score);
-
-    const MIN_ALIGN_SCORE = 5;
-    const rankedCats = ranked.filter(r => r.score >= (MIN_ALIGN_SCORE - 2));
-    const topRanked = rankedCats.slice(0, 3);
-    const topCats = topRanked.map(r => r.meta);
-    const domainAligned = ranked.some(r => r.score >= MIN_ALIGN_SCORE);
+      score: scoreCatToObjetoLote(c, objetoBase, '')
+    }));
+    const rankedCats = preRank.sort((a,b)=>b.score - a.score).slice(0,5);
+    const topCats = rankedCats.map(r=>r.meta);
+    const domainAligned = rankedCats.some(r=>r.score>=7);
     bump(60, 'CATs selecionadas');
 
-    // requisitos
+    // Análise de requisitos
     const allRequirements = await extractRequirementsFromBid(editalText);
     const requirementsToAnalyze = (allRequirements || []).filter(r =>
       !/credenciamento|chave|senha|licitanet|comprasnet|bll|enviar proposta/i.test(r || '')
@@ -192,150 +274,126 @@ async function analisarEditalCore(files, onProgress = () => {}, opts = {}) {
     const techBlocks = [];
     const adminBlocks = [];
 
-    const maxScore = (topRanked[0]?.score || 0) || 1;
+    const maxScore = rankedCats[0]?.score || 1;
 
-    for (let i = 0; i < requirementsToAnalyze.length; i++) {
-      const reqTxt = requirementsToAnalyze[i];
+    for (const reqTxt of requirementsToAnalyze) {
       const isTech = TECH_REQ_RX.test(reqTxt.toLowerCase());
-
       if (isTech) {
         if (topCats.length > 0) {
-          const bullets = topRanked.map(r => {
+          const bullets = rankedCats.map(r => {
             const c = r.meta;
             const tags = [c.catNum ? `CAT nº ${c.catNum}` : null, c.hasART ? 'ART' : null, c.hasCREA ? 'CREA/CAU' : null]
               .filter(Boolean).join(' · ');
-            const label = `${c.nomeCAT}${c.ano ? ` (${c.ano})` : ''}`;
             const conf = Math.round(Math.min(97, Math.max(55, (r.score / maxScore) * 100)));
-            return `• ${label} — ${tags || '—'} — **conf.: ${conf}%**`;
+            return `- ${c.nomeCAT}${c.ano ? ` (${c.ano})` : ''} — ${tags || '—'} — **conf.: ${conf}%**`;
           }).join('\n');
 
           const status = domainAligned ? '🟢 ATENDIDO.' : '🟡 ATENDIDO PARCIALMENTE.';
-          const note = domainAligned ? '' : '\n\n> Observação: CATs localizadas com aderência parcial; recomenda-se substituir por CATs do mesmo escopo do edital.';
-          const block = `Requisito: ${reqTxt}\n\n${status}\n\nA qualificação técnica é suportada pelas seguintes CATs do acervo:\n${bullets}${note}`;
-          detailedAnalyses.push(block);
-          techBlocks.push(block);
+          detailedAnalyses.push(`Requisito: ${reqTxt}\n\n${status}\n\n${bullets}`);
+          techBlocks.push(reqTxt);
         } else {
-          const block = `Requisito: ${reqTxt}\n\n🔴 **NÃO ATENDIDO** — Não foram localizadas CATs aderentes no acervo.`;
+          const block = `Requisito: ${reqTxt}\n\n🔴 **NÃO ATENDIDO** — Sem CATs aderentes.`;
           detailedAnalyses.push(block);
           techBlocks.push(block);
         }
       } else {
         let block;
-        if (companyProfile) {
-          // >>> FIX: passa o profile no 3º parâmetro (antes estava errado)
-          block = await analyzeRequirementWithContext(reqTxt, null, companyProfile);
-        } else {
-          const evidence = await findEvidenceOnTheFly(reqTxt, filesForEvidenceSearch, collection);
-          block = await analyzeSingleRequirement(reqTxt, evidence);
+        if (companyProfile) block = await analyzeRequirementWithContext(reqTxt, null, companyProfile);
+        else {
+          const evidence = await findEvidenceOnTheFly(reqTxt, localFilesText, chunksCol);
+          block = await analyzeRequirementWithContext(reqTxt, evidence, null);
         }
         detailedAnalyses.push(block);
         adminBlocks.push(block);
       }
+    }
 
-      if (i % 3 === 0) {
-        const pct = Math.min(80, 60 + Math.round(((i + 1) / Math.max(1, requirementsToAnalyze.length)) * 20));
-        bump(pct, 'Analisando requisitos');
+    /* ======= Viabilidade Técnica ======= */
+    const blocoViabilidade = (topCats.length
+      ? `### Viabilidade profissional e técnica\n\nCom base no acervo (CATs), identificamos ${domainAligned ? '**aderência técnica direta**' : '**aderência parcial**'}:\n\n${topCats.map(c => {
+          const comp = [c.catNum ? `CAT nº ${c.catNum}` : null, c.hasART ? 'ART' : null, c.hasCREA ? 'CREA/CAU' : null].filter(Boolean).join(' · ');
+          return `- ${c.nomeCAT} | ${c.orgao || '-'} | ${c.ano || '-'}\n  - **Escopo:** ${c.escopo}\n  - **Comprovações:** ${comp || '—'}`;
+        }).join('\n\n')}`
+      : '### Viabilidade profissional e técnica\n\n- Nenhuma CAT aderente encontrada.');
+
+    /* ======= Lotes: aderência individual ======= */
+    const lotesAnalise = [];
+    if (header.resumoLotes) {
+      const lotes = header.resumoLotes.split(/\n+/).filter(Boolean);
+      for (const linha of lotes) {
+        const top = await rankCatsFor(linha, { catsCol, chunksCol, localFilesText, companyId });
+        const max = top[0]?.score || 1;
+        lotesAnalise.push({
+          titulo: linha.replace(/^\s*Lote\s*\d+\s*[:\-–]\s*/i, '').trim(),
+          bullets: top.map(r => {
+            const c = r.meta;
+            const conf = Math.round(Math.min(97, Math.max(55, (r.score / max) * 100)));
+            const tags = [c.catNum ? `CAT nº ${c.catNum}` : null, c.hasART ? 'ART' : null, c.hasCREA ? 'CREA/CAU' : null].filter(Boolean).join(' · ');
+            return `- ${c.nomeCAT}${c.ano ? ` (${c.ano})` : ''} — ${tags || '—'} — **conf.: ${conf}%**`;
+          }).join('\n') || '- (sem CATs aderentes)'
+        });
       }
     }
 
-    // viabilidade técnica
-    const blocoViabilidade = (topCats.length
-      ? `### Viabilidade profissional e técnica
+    const blocoLotes = lotesAnalise.length
+      ? ['## Aderência por Lote', ...lotesAnalise.map(l => `### ${l.titulo}\n${l.bullets}`)].join('\n\n')
+      : '';
 
-Com base no acervo (CATs), identificamos ${domainAligned ? '**aderência técnica direta**' : '**aderência parcial**'} ao objeto licitado:
-
-${topCats.map(c => {
-  const comp = [c.catNum ? `CAT nº ${c.catNum}` : null, c.hasART ? 'ART' : null, c.hasCREA ? 'CREA/CAU' : null].filter(Boolean).join(' · ');
-  const head = [`**CAT:** ${c.nomeCAT}`, c.orgao ? `**Órgão/Entidade:** ${c.orgao}` : null, c.ano ? `**Ano:** ${c.ano}` : null].filter(Boolean).join(' | ');
-  return `- ${head}
-  - **Escopo/Resumo:** ${c.escopo}
-  - **Comprovações:** ${comp || '—'}`;
-}).join('\n\n')}`
-      : '### Viabilidade profissional e técnica\n\n- **Não localizamos CATs aderentes automaticamente.** Recomenda-se checagem manual do acervo.'
-    );
-
-    // RT sugerido
-    const rtSugerido = suggestBestRT(topCats, header.objetoLicitado || editalText);
+    // RT sugerido (baseado no objeto geral)
     let blocoRT = '';
-    if (rtSugerido) {
-      const reqBase = [header.objetoLicitado || '', ...(Array.isArray(allRequirements) ? allRequirements : [])].join('\n');
-      const chosenCat = topCats.find(c => c.nomeCAT === rtSugerido.arquivo) || topCats[0];
-      const comp = compareReqVsCat(reqBase, chosenCat?.raw || '');
-      blocoRT = [
-        '### Responsável Técnico Sugerido',
-        `**Nome:** ${rtSugerido.profissional}`,
-        `**CAT nº / Ano / Órgão:** ${rtSugerido.catNum} / ${rtSugerido.ano} / ${rtSugerido.orgao}`,
-        `**Escopo (resumo):** ${rtSugerido.escopo}`,
-        `**Fonte (arquivo):** ${rtSugerido.arquivo}`,
-        '',
-        '#### Comprovação de equivalência/excedente frente ao edital',
-        (comp.length ? comp.map(l => `- ${l}`).join('\n') : '- (Sem parâmetros comparáveis explícitos)')
-      ].join('\n\n');
+    if (topCats.length) {
+      const rtSugerido = suggestBestRT(topCats, header.objetoLicitado || editalText);
+      if (rtSugerido) {
+        const chosenCat = topCats.find(c => c.nomeCAT === rtSugerido.arquivo) || topCats[0];
+        const comp = compareReqVsCat([header.objetoLicitado, header.resumoLotes].filter(Boolean).join('\n'), chosenCat?.raw || '');
+        blocoRT = [
+          '### Responsável Técnico Sugerido',
+          `**Nome:** ${rtSugerido.profissional}`,
+          `**CAT nº / Ano / Órgão:** ${rtSugerido.catNum} / ${rtSugerido.ano} / ${rtSugerido.orgao}`,
+          `**Escopo (resumo):** ${rtSugerido.escopo}`,
+          `**Fonte (arquivo):** ${rtSugerido.arquivo}`,
+          '',
+          '#### Comprovação frente ao edital',
+          (comp.length ? comp.map(l => `- ${l}`).join('\n') : '- (Sem parâmetros comparáveis explícitos)')
+        ].join('\n\n');
+      }
     }
 
-    // sumário + recomendação 70/30
-    let summary = await generateExecutiveSummary(detailedAnalyses);
-    bump(90, 'Sumário executivo');
+    const summary = await generateExecutiveSummary(detailedAnalyses);
+    bump(90, 'Sumário');
 
     const tech = summarize(techBlocks);
     const admin = summarize(adminBlocks);
     const rec = buildRecommendation({ tech, admin, hasAlignedCAT: domainAligned });
 
-    const quadroPontuacao = [
-      '## Recomendação Final e Pontuação',
-      rec.markdown
-    ].join('\n\n');
-
-    // header
-    const headerItems = [
-      `### Órgão Licitório\n${header.orgaoLicitante || '-'}`,
-      `### Concorrência Eletrônica\n${header.concorrenciaEletronica || '-'}`,
-      `### Tipo\n${header.tipo || '-'}`,
-      `### Prazo de execução\n${header.prazoExecucao || '-'}`,
-      `### Classificação de Despesa e valor do objeto\n${header.classificacaoDespesaEValor || '-'}`,
-      `### Objeto licitado\n${header.objetoLicitado || '-'}`,
-      `### Prazo máximo para proposta\n${header.prazoMaximoParaProposta || '-'}`,
-    ];
-
-    // confiança CATs
-    let blocoConfianca = '';
-    if (topRanked.length) {
-      const max = topRanked[0].score || 1;
-      const linhas = topRanked.map(r => {
-        const conf = Math.round(Math.min(97, Math.max(55, (r.score / max) * 100)));
-        return `- ${r.meta.nomeCAT}${r.meta.ano ? ` (${r.meta.ano})` : ''} — **conf.: ${conf}%**`;
-      }).join('\n');
-      blocoConfianca = ['### Confiança de Aderência das CATs Selecionadas', linhas].join('\n\n');
-    }
+    const quadroPontuacao = ['## Recomendação Final e Pontuação', rec.markdown].join('\n\n');
 
     const finalReport = [
       '# RELATÓRIO DE VIABILIDADE',
-      headerItems.join('\n\n---\n\n'),
       '---',
       blocoViabilidade,
-      blocoConfianca ? `\n---\n\n${blocoConfianca}` : '',
       blocoRT ? `\n---\n\n${blocoRT}` : '',
+      blocoLotes ? `\n---\n\n${blocoLotes}` : '',
       '---',
       quadroPontuacao,
       '---',
       '## Sumário Executivo',
       summary,
-      '---',
+      '[[PAGE_BREAK]]',
       '## Análise Detalhada',
-      detailedAnalyses.join('\n\n---\n\n') || '- (Não foi possível gerar a análise detalhada)'
+      detailedAnalyses.join('\n\n---\n\n') || '- (não gerado)'
     ].join('\n\n');
 
     const { publicUrl, filePath, filename } = await gerarPdf(finalReport, companyId);
     bump(100, 'PDF emitido');
 
-    for (const f of allUploadedFiles) { try { if (f?.path && fs.existsSync(f.path)) fs.unlinkSync(f.path); } catch {} }
+    for (const f of allFiles) { try { fs.existsSync(f.path) && fs.unlinkSync(f.path); } catch {} }
 
     return { report: finalReport, pdf: { filename, url: publicUrl, path: filePath } };
-
-  } catch (error) {
-    console.error('[analisarEditalCore] erro:', error?.stack || error);
-    for (const f of allUploadedFiles) { try { if (f?.path && fs.existsSync(f.path)) fs.unlinkSync(f.path); } catch {} }
-    throw error;
+  } catch (err) {
+    console.error('[analisarEditalCore] erro:', err);
+    for (const f of allFiles) { try { fs.existsSync(f.path) && fs.unlinkSync(f.path); } catch {} }
+    throw err;
   }
 }
 

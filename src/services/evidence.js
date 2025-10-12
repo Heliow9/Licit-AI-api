@@ -1,4 +1,3 @@
-// src/services/evidence.js
 const { MAX_CHUNKS_PER_FILE } = require('../Config/env');
 const { chatText, embedText, embedTexts } = require('./azure');
 const { chunkTextGenerator, cosineSim } = require('../utils/text');

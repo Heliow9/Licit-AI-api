@@ -1,36 +1,75 @@
-// services/cats.js
+/**
+ * src/services/cats.js — versão completa e robusta
+ *
+ * • Multi-tenant (companyId / tenantId)
+ * • Busca híbrida (vetorial + léxico/regex + arquivos locais)
+ * • Scoring híbrido (60% semântico, 40% léxico/metadados)
+ * • Domínios ampliados (inclui saúde/assistência social, IP, água etc.)
+ * • Extração e comparação de capacidades (kVA, kV, TR, endereçável)
+ * • RT sugerido ponderando domínio/recência/metadados
+ */
+
 const { ObjectId } = require('mongodb');
 const { extractCATMeta } = require('../utils/cat_meta');
+const { embedText } = require('./azure'); // embeddings do seu stack (MongoDB Atlas Vector ou similar)
 
-/** Taxonomia de domínios + palavras-chave (facilmente expandível) */
+/* =====================================================================
+ * TAXONOMIA DE DOMÍNIOS (expansível)
+ * ===================================================================== */
 const DOMAIN_LEXICON = {
   eletrica: [
     'subesta', 'kva', '\\bkv\\b', 'transformador', 'disjuntor', 'qgbt',
     'cabine primária', 'baixa tensão', 'média tensão', 'proteção elétrica',
-    'religadores?', 'seccionadoras?', 'barramentos?', '\\bLT\\b', '\\bLD\\b'
+    'religadores?', 'seccionadoras?', 'barramentos?', '\\bLT\\b', '\\bLD\\b',
+    // Iluminação Pública
+    'ilumina[çc][aã]o\\s+p[úu]blica', 'lumin[áa]ri[ao]s?', '\\bled\\b',
+    'fotoc[eé]lula', 'rel[eé]\\s*fot[oô]el[eé]trico',
+    'poste(s)?\\s+de\\s+ilumina', 'bra[çc]o\\s+de\\s+luz',
+    'parque\\s+de\\s+ilumina', 'pontos?\\s+de\\s+luz',
+    'ilumina[çc][aã]o\\s+vi[áa]ria', 'driver\\s+de\\s+lumin[áa]ria',
+    '\\brel[eé]\\b', '\\bip\\b(?![a-z0-9])'
   ],
-  clima: [
-    'climatiza', 'ar condicionado', 'chiller', 'fan ?coil', 'vrf', '\\btr\\b', 'split', 'self contained'
+  civil: [
+    'edifica', 'paviment', 'obra civil', 'concreto', 'alvenaria', 'fund[aá]cao',
+    'creche', 'escola', 'pr[eé]dio', 'manuten[çc][aã]o predial', 'reforma'
   ],
   incendio: [
     'inc[êe]ndio', 'sdai', 'sprinkler', 'hidrante', 'bomba de incêndio',
     'endere[cç]a', 'alarme', 'detec[çc][aã]o'
   ],
+  clima: [
+    'climatiza', 'ar condicionado', 'chiller', 'fan ?coil', 'vrf', '\\btr\\b', 'split', 'self contained'
+  ],
   agua: [
     'micromedi', 'hidr[oó]metro', 'adu[cç][aã]o', '\\beta\\b', '\\bete\\b', '\\betap\\b',
     'po[çc]o', 'submers[ií]vel', 'per[íi]metros de irriga', 'bomba d[\' ]?água'
   ],
-  civil: [
-    'edifica', 'paviment', 'obra civil', 'concreto', 'alvenaria', 'fund[aá]cao', 'creche', 'escola', 'pr[eé]dio',
-    'manuten[çc][aã]o predial', 'reforma'
+  // NOVO: Saúde/Assistência Social (idosos, home care, UBS/UPA, etc.)
+  saude_social: [
+    'sa[úu]de', 'sistema\\s+[úu]nico\\s+de\\s+sa[úu]de|\\bSUS\\b',
+    'assist[êe]ncia\\s+social', '\\bSUAS\\b', '\\bCRAS\\b', '\\bCREAS\\b',
+    'unidade\\s+b[áa]sica\\s+de\\s+sa[úu]de|\\bUBS\\b', '\\bUPA\\b', 'posto\\s+de\\s+sa[úu]de',
+    'hospital', 'cl[ií]nica', 'ambulat[óo]rio',
+    // idosos/geronto/home care
+    'idos[oa]s?', 'geriatr', 'geronto', 'casa\\s+lar',
+    'institui[çc][aã]o\\s+de\\s+longa\\s+perman[êe]ncia|\\bILPI\\b',
+    'cuidad(?:or|ora)(?:es)?\\s+de\\s+idos[oa]s?',
+    'cuidado\\s+domiciliar', 'home\\s*care',
+    'enferm(?:eir[oa]s?)?', 't[ée]cnico\\s+de\\s+enfermagem',
+    'curativos?', 'medica[çc][aã]o'
   ],
 };
 
-/** Sinônimos adicionais (bem comuns em filename) por domínio */
+// Sinônimos adicionais (comuns em filename) por domínio
 const EXTRA_DOMAIN_SYNONYMS = {
   eletrica: [
     '\\bLT\\b', '\\bLD\\b', 'linha viva', 'linha morta', '\\b69\\s*kV\\b', '\\b138\\s*kV\\b', '\\b230\\s*kV\\b',
-    'subesta[cç][aã]o', '\\bSE\\b', 'alimentador', 'barramento', 'disjuntor', 'religador', 'transformador'
+    'subesta[cç][aã]o', '\\bSE\\b', 'alimentador', 'barramento', 'disjuntor', 'religador', 'transformador',
+    // IP
+    'ilumina[çc][aã]o\\s+p[úu]blica', 'lumin[áa]ria', '\\bled\\b',
+    'poste\\s+de\\s+ilumina', 'bra[çc]o\\s+de\\s+luz',
+    'fotoc[eé]lula', 'rel[eé]\\s*fot[oô]el[eé]rico',
+    'parque\\s+de\\s+ilumina', 'pontos?\\s+de\\s+luz', '\\bip\\b(?![a-z0-9])'
   ],
   civil: [
     'reforma', 'manuten[cç][aã]o predial', 'edifica[cç][aã]o', 'escola', 'creche', 'obra civil', 'alvenaria', 'concreto'
@@ -43,10 +82,17 @@ const EXTRA_DOMAIN_SYNONYMS = {
   ],
   agua: [
     'adu[cç][aã]o', '\\beta\\b', '\\bete\\b', '\\betap\\b', 'po[çc]o', 'hidr[oó]metro'
+  ],
+  saude_social: [
+    '\\bUBS\\b', '\\bUPA\\b', '\\bSUS\\b', '\\bCRAS\\b', '\\bCREAS\\b', '\\bILPI\\b',
+    'home\\s*care', 'cuidador(?:a)?\\s+de\\s+idos', 'geriatr', 'geronto',
+    'enfermagem', 'hospital', 'cl[íi]nica', 'ambulatório'
   ]
 };
 
-/** Assinaturas de domínio a partir de um texto (objeto/lote ou CAT) */
+/* =====================================================================
+ * HELPERS
+ * ===================================================================== */
 function signaturesFor(text = '') {
   const s = String(text || '').toLowerCase();
   const hits = new Set();
@@ -56,7 +102,6 @@ function signaturesFor(text = '') {
   return Array.from(hits);
 }
 
-/** Base de termos: quando há domínio, foca; quando não, usa conjunto amplo */
 function baseTermSet(seed = '') {
   const doms = signaturesFor(seed);
   const set = new Set();
@@ -76,7 +121,6 @@ function baseTermSet(seed = '') {
   return set;
 }
 
-/** Extrai meta do filename: ano, catNum, órgão e domínios pelo nome */
 function parseFilenameMeta(fileName = '') {
   const fn = String(fileName || '');
   const lower = fn.toLowerCase();
@@ -84,12 +128,10 @@ function parseFilenameMeta(fileName = '') {
   const catNum = (lower.match(/cat\s*(?:n[ºo]\s*)?[\-:\s]*([\d]{2,}\/?\d{0,4})/) || [])[1] || '';
   const ano    = (fn.match(/\b(19\d{2}|20\d{2})\b/) || [])[1] || '';
 
-  // Órgão comum no nome
   let orgao = '';
   const orgMatches = fn.match(/\b(CELPE|CHESF|PM\s+DE\s+[A-ZÇÃÕ ]+|PREFEITURA\s+DE\s+[A-ZÇÃÕ ]+|CREA-?[A-Z]{2})\b/i);
   if (orgMatches) orgao = orgMatches[0];
 
-  // Domínios: lexicon + sinônimos extra
   const hits = new Set(signaturesFor(fn));
   for (const [dom, syns] of Object.entries(EXTRA_DOMAIN_SYNONYMS)) {
     if (syns.some(rx => new RegExp(rx, 'i').test(fn))) hits.add(dom);
@@ -103,197 +145,220 @@ function parseFilenameMeta(fileName = '') {
   };
 }
 
-/** Overlap de domínios entre objeto e texto/filename da CAT */
 function hasDomainOverlap(objText = '', catText = '', fileName = '') {
   const objSigs = new Set(signaturesFor(objText));
-  if (!objSigs.size) return true; // sem domínio no objeto, não bloqueia
   const catSigs = new Set([
     ...signaturesFor(catText || ''),
     ...signaturesFor(fileName || '')
   ]);
-  for (const [dom, syns] of Object.entries(EXTRA_DOMAIN_SYNONYMS)) {
-    if (new RegExp(syns.join('|'), 'i').test(fileName)) catSigs.add(dom);
-  }
+  if (!objSigs.size) return true; // sem domínio no objeto → não bloqueia
   for (const d of objSigs) if (catSigs.has(d)) return true;
   return false;
 }
 
-// util para quando vier só "source" e quisermos tratá-lo como nome
 function pathSafeFileName(src = '') {
   const p = String(src);
   const parts = p.split(/[\\/]/);
   return parts[parts.length - 1] || p;
 }
 
-function toOid(v) {
-  try { return new ObjectId(String(v)); } catch { return null; }
-}
+function toOid(v) { try { return new ObjectId(String(v)); } catch { return null; } }
 function buildTenantFilter(tenantId) {
   if (!tenantId) return null;
   const oid = toOid(tenantId);
   return { $or: [{ companyId: String(tenantId) }, ...(oid ? [{ companyId: oid }] : [])] };
 }
 
+function tokenOverlapScore(a = '', b = '') {
+  const stop = new Set(['de','da','do','das','dos','e','em','para','por','com','um','uma','o','a','os','as','no','na','nos','nas','que','ou','se','ao','à','às']);
+  const norm = s => String(s||'').toLowerCase().replace(/[^a-zà-ú0-9\s]/gi,' ').split(/\s+/)
+    .filter(w => w && w.length >= 4 && !stop.has(w));
+  const A = new Set(norm(a)); const B = new Set(norm(b));
+  let hit = 0; for (const w of A) if (B.has(w)) hit++; return hit;
+}
+
+function clamp01(x) { return x < 0 ? 0 : x > 1 ? 1 : x; }
+function normalizeCosineTo01(raw) { if (raw == null) return 0; return clamp01(raw / 1.0); }
+
+/* =====================================================================
+ * BUSCA HÍBRIDA (principal)
+ * ===================================================================== */
 /**
- * Busca híbrida por CATs (multi-tenant ready):
- *   findCATMatches({ catsCol, chunksCol }, objetoText, limit, localFiles, { tenantId, debug })
+ * findCATMatches({ catsCol, chunksCol }, objetoText, limit, localFiles, { tenantId, debug })
  */
 async function findCATMatches(collectionOrChunks, objetoText, limit = 6, localFiles = [], opts = {}) {
   const termSet = baseTermSet(objetoText || '');
   const debug = typeof opts.debug === 'function' ? opts.debug : () => {};
-  const tenantFilter = buildTenantFilter(opts.tenantId);
-  let cats = [];
+  const tenantFilter = buildTenantFilter(opts.tenantId || opts.companyId);
 
   const catsCol   = collectionOrChunks?.catsCol || null;
   const chunksCol = collectionOrChunks?.chunksCol || (collectionOrChunks && !collectionOrChunks.catsCol ? collectionOrChunks : null);
 
   const objDomains = signaturesFor(objetoText || '');
+  const domainTerms = objDomains.flatMap(d => DOMAIN_LEXICON[d] || []);
 
-  // ====== 1) Coleção CATS (preferencial)
-  if (catsCol) {
-    const mustBeCAT = {
-      $or: [
-        { fileName: { $regex: 'cat|certid[aã]o.*acervo|acervo.*t[ée]cnico', $options: 'i' } },
-        { fullText: { $regex: 'Certid[aã]o de Acervo T[ée]cnico|\\bCAT\\b', $options: 'i' } }
-      ]
-    };
+  const candidates = [];
 
-    // Usa TODOS os domínios detectados
-    const domainTerms = objDomains.flatMap(d => DOMAIN_LEXICON[d] || []);
-    const domainFilter = domainTerms.length
-      ? {
-          $or: [
-            { fileName: { $regex: domainTerms.join('|'), $options: 'i' } },
-            { fullText: { $regex: domainTerms.join('|'), $options: 'i' } }
-          ]
-        }
-      : null;
-
-    const ands = [mustBeCAT];
-    if (domainFilter) ands.push(domainFilter);
-    if (tenantFilter) ands.push(tenantFilter);
-
-    const q = ands.length > 1 ? { $and: ands } : ands[0];
-
-    const proj = { _id: 0, source: 1, fileName: 1, fullText: 1 };
-    const catsDocs = await catsCol.find(q, { projection: proj }).limit(limit * 5).toArray();
-
-    debug({ kind: 'mongoBatchCats', total: catsDocs.length });
-    for (let i = 0; i < catsDocs.length; i++) {
-      const doc = catsDocs[i];
-      cats.push({ source: doc.source || doc.fileName, fileName: doc.fileName, text: doc.fullText });
-      debug({ kind: 'mongoItemCats', i: i + 1, total: catsDocs.length, source: doc.fileName });
+  /* ===== A) SEMÂNTICA / VETORIAL ===== */
+  try {
+    const qv = await embedText(objetoText || '');
+    if (catsCol) {
+      const ands = [];
+      if (tenantFilter) ands.push(tenantFilter);
+      if (domainTerms.length) {
+        ands.push({ $or: [
+          { fileName: { $regex: domainTerms.join('|'), $options: 'i' } },
+          { fullText: { $regex: domainTerms.join('|'), $options: 'i' } }
+        ]});
+      }
+      const query = ands.length ? { $and: ands } : {};
+      const pipeline = [
+        { $vectorSearch: { index: 'vector_index', path: 'embedding', queryVector: qv, numCandidates: 200, limit: Math.max(limit * 3, 12) } },
+        { $match: query },
+        { $project: { _id: 0, source: 1, fileName: 1, fullText: 1, _score: { $meta: 'vectorSearchScore' } } }
+      ];
+      const vecCats = await catsCol.aggregate(pipeline).toArray();
+      debug({ kind: 'vecCats', total: vecCats.length });
+      for (const d of vecCats) {
+        candidates.push({ kind: 'cat', source: d.source || d.fileName, fileName: d.fileName, text: d.fullText, vecScore: normalizeCosineTo01(d._score) });
+      }
+    } else if (chunksCol) {
+      const ands = [{ $or: [
+        { text: { $regex: 'Certid[aã]o de Acervo T[ée]cnico', $options: 'i' } },
+        { text: { $regex: '\\bCAT\\b', $options: 'i' } }
+      ]}];
+      if (tenantFilter) ands.push(tenantFilter);
+      if (domainTerms.length) {
+        ands.push({ $or: [
+          { text: { $regex: domainTerms.join('|'), $options: 'i' } },
+          { source: { $regex: domainTerms.join('|'), $options: 'i' } }
+        ]});
+      }
+      const query = { $and: ands };
+      const pipeline = [
+        { $vectorSearch: { index: 'vector_index', path: 'embedding', queryVector: qv, numCandidates: 400, limit: Math.max(limit * 4, 16) } },
+        { $match: query },
+        { $project: { _id: 0, source: 1, text: 1, _score: { $meta: 'vectorSearchScore' } } }
+      ];
+      const vecChunks = await chunksCol.aggregate(pipeline).toArray();
+      debug({ kind: 'vecChunks', total: vecChunks.length });
+      for (const d of vecChunks) {
+        candidates.push({ kind: 'chunk', source: d.source, fileName: pathSafeFileName(d.source), text: d.text, vecScore: normalizeCosineTo01(d._score) });
+      }
     }
+  } catch (e) {
+    debug({ kind: 'vecError', message: e?.message });
   }
 
-  // ====== 2) Coleção CHUNKS (compatibilidade)
-  if (chunksCol) {
-    const orTerms = Array.from(termSet).map(t => ({ text: { $regex: t, $options: 'i' } }));
-    const mustBeCAT = [
-      { text: { $regex: 'Certid[aã]o de Acervo T[ée]cnico', $options: 'i' } },
-      { text: { $regex: '\\bCAT\\b', $options: 'i' } },
-    ];
+  /* ===== B) LÉXICO/REGEX ===== */
+  async function pushLexiconFromCol(col, isCatsCol) {
+    const orTerms = Array.from(termSet).map(t => (isCatsCol
+      ? { fullText: { $regex: t, $options: 'i' } }
+      : { text: { $regex: t, $options: 'i' } }));
+
+    const mustBeCAT = isCatsCol
+      ? [{ fileName: { $regex: 'cat|certid[aã]o.*acervo|acervo.*t[ée]cnico', $options: 'i' } },
+         { fullText: { $regex: 'Certid[aã]o de Acervo T[ée]cnico|\\bCAT\\b', $options: 'i' } }]
+      : [{ text: { $regex: 'Certid[aã]o de Acervo T[ée]cnico', $options: 'i' } },
+         { text: { $regex: '\\bCAT\\b', $options: 'i' } }];
+
     const ands = [{ $or: mustBeCAT }, { $or: orTerms }];
     if (tenantFilter) ands.push(tenantFilter);
+    if (domainTerms.length) {
+      ands.push({ $or: isCatsCol
+        ? [{ fileName: { $regex: domainTerms.join('|'), $options: 'i' } }, { fullText: { $regex: domainTerms.join('|'), $options: 'i' } }]
+        : [{ source: { $regex: domainTerms.join('|'), $options: 'i' } }, { text: { $regex: domainTerms.join('|'), $options: 'i' } }] });
+    }
+
     const q = { $and: ands };
-
-    const chunks = await chunksCol.find(q, { projection: { _id: 0, source: 1, text: 1 } }).limit(limit * 3).toArray();
-
-    debug({ kind: 'mongoBatchChunks', total: chunks.length });
-    for (let i = 0; i < chunks.length; i++) {
-      const doc = chunks[i];
-      cats.push({ source: doc.source, fileName: pathSafeFileName(doc.source), text: doc.text });
-      debug({ kind: 'mongoItemChunks', i: i + 1, total: chunks.length, source: doc.source });
+    const proj = isCatsCol ? { _id: 0, source: 1, fileName: 1, fullText: 1 }
+                           : { _id: 0, source: 1, text: 1 };
+    const docs = await col.find(q, { projection: proj }).limit(limit * 5).toArray();
+    debug({ kind: isCatsCol ? 'lexCats' : 'lexChunks', total: docs.length });
+    for (const d of docs) {
+      candidates.push({
+        kind: isCatsCol ? 'cat' : 'chunk',
+        source: d.source || d.fileName,
+        fileName: isCatsCol ? d.fileName : pathSafeFileName(d.source),
+        text: isCatsCol ? d.fullText : d.text,
+        vecScore: null,
+      });
     }
   }
+  if (catsCol) await pushLexiconFromCol(catsCol, true);
+  if (chunksCol) await pushLexiconFromCol(chunksCol, false);
 
-  // ====== 3) Locais (mesma lógica de antes)
-  const looksLikeCATName = (name = '') =>
-    /cat|certid[aã]o.*acervo|acervo.*t[ée]cnico/i.test(name) && !/edital/i.test(name);
+  /* ===== C) ARQUIVOS LOCAIS ===== */
+  const looksLikeCATName = (name = '') => /cat|certid[aã]o.*acervo|acervo.*t[ée]cnico/i.test(name) && !/edital/i.test(name);
+  const strongCATFingerprint = (txt = '') => /Certid[aã]o de Acervo T[ée]cnico/i.test(txt) && /CAT\s*[NºNo\.:\- ]+\s*\d{3,}/i.test(txt);
 
-  const strongCATFingerprint = (txt = '') =>
-    /Certid[aã]o de Acervo T[ée]cnico/i.test(txt) && /CAT\s*[NºNo\.:\- ]+\s*\d{3,}/i.test(txt);
-
-  const localCandidates = [];
-  for (const f of localFiles) {
+  for (const f of (localFiles || [])) {
     if (!f?.text) continue;
     if (!(looksLikeCATName(f.source) || strongCATFingerprint(f.text))) continue;
     if (Array.from(termSet).some(t => new RegExp(String(t), 'i').test(f.text))) {
-      localCandidates.push({ source: f.source, fileName: f.source, text: f.text });
+      candidates.push({ kind: 'local', source: f.source, fileName: f.source, text: f.text, vecScore: null });
     }
   }
-  debug({ kind: 'localBatch', total: localCandidates.length, offset: cats.length });
-  for (let i = 0; i < localCandidates.length; i++) {
-    const cand = localCandidates[i];
-    cats.push(cand);
-    debug({ kind: 'localItem', i: i + 1, total: localCandidates.length, offset: cats.length - localCandidates.length, source: cand.source });
-  }
 
-  // ====== 4) Scoring + filtros (inclui sinais do filename)
-  const scored = (cats || []).map(c => {
+  /* ===== D) SCORE HÍBRIDO ===== */
+  const scored = (candidates || []).map(c => {
     const metaFromText = extractCATMeta(c.source, c.text || '');
     const fromName = parseFilenameMeta(c.fileName || c.source || '');
-
-    // 🔧 junta hints (não sobrescreve os que já existirem no meta)
     const mergedHints = { ...(metaFromText.fileHints || {}), ...fromName };
+    const meta = { ...metaFromText, fileName: c.fileName, raw: metaFromText.raw, fileHints: mergedHints };
 
-    const meta = {
-      ...metaFromText,
-      fileName: c.fileName,
-      raw: metaFromText.raw,
-      fileHints: mergedHints
-    };
+    // LEX: léxico/metadados
+    let lex = 0;
+    for (const t of baseTermSet(objetoText)) if (new RegExp(t, 'i').test(meta.raw)) lex += 1;
+    if (meta.hasART) lex += 2;
+    if (meta.hasCREA) lex += 1;
+    if (meta.mentionsManut) lex += 1;
+    if (meta.mentionsObra) lex += 1;
+    if (/\batividade conclu[ií]da|obra conclu[ií]da|conclu[ií]d[ao]\b/i.test(meta.raw)) lex += 1;
 
-    let score = 0;
-
-    // Ocorrência de termos no texto
-    for (const t of termSet) if (new RegExp(t, 'i').test(meta.raw)) score += 1;
-
-    // Metadados do texto
-    if (meta.hasART) score += 2;
-    if (meta.hasCREA) score += 1;
-    if (meta.mentionsManut) score += 1;
-    if (meta.mentionsObra) score += 1;
-    if (/\batividade conclu[ií]da|obra conclu[ií]da|conclu[ií]d[ao]\b/i.test(meta.raw)) score += 1;
-
-    // Bônus por domínios do filename baterem com o objeto
     const objSigs = new Set(signaturesFor(objetoText));
     const fileSigs = new Set(fromName.fileDomains || []);
-    for (const d of objSigs) if (fileSigs.has(d)) score += 3;
-
-    // Recência (ano do filename > ano no texto)
+    for (const d of objSigs) if (fileSigs.has(d)) lex += 3;
     const yr = Number(fromName.fileYear) || Number(pickReasonableYear(meta.raw)) || 0;
-    if (yr) score += (yr - 2010) / 12;
+    if (yr) lex += (yr - 2010) / 12;
 
-    return { meta, score };
+    if (objSigs.size === 0) {
+      const ov = tokenOverlapScore(objetoText, meta.raw);
+      lex += Math.min(ov, 4);
+      if (ov === 0) lex -= 5;
+    }
+
+    const vec = c.vecScore == null ? 0 : c.vecScore;
+    const lex01 = clamp01(lex / 15);
+    const finalScore = (0.60 * vec) + (0.40 * lex01);
+
+    return { meta, score: finalScore, rawLex: lex, rawVec: vec };
   })
-  // Remove duplicadas por (nomeCAT + nº CAT) OU por filename
   .filter((v, i, a) =>
     a.findIndex(t =>
       (t.meta.nomeCAT === v.meta.nomeCAT && t.meta.catNum === v.meta.catNum) ||
       (t.meta.fileName && v.meta.fileName && t.meta.fileName === v.meta.fileName)
     ) === i
   )
-  // Hard filter: se objeto tem domínio, exige overlap (texto ou filename)
   .filter(s => hasDomainOverlap(objetoText, s.meta.raw, s.meta.fileName))
   .sort((a, b) => b.score - a.score)
   .slice(0, limit * 3);
 
-  debug({ kind: 'scored', count: scored.length });
+  debug({ kind: 'scoredHybrid', count: scored.length });
   return scored.map(s => s.meta);
 }
 
-/** Ano razoável (capado em ano atual + 1 para evitar “2071”) */
+/* =====================================================================
+ * UTILITÁRIOS DE ANO / DEDUPE
+ * ===================================================================== */
 function pickReasonableYear(text = '') {
   const now = new Date().getFullYear();
   const years = (String(text || '').match(/\b(19\d{2}|20\d{2})\b/g) || [])
-    .map(Number)
-    .filter(y => y >= 1990 && y <= (now + 1));
+    .map(Number).filter(y => y >= 1990 && y <= (now + 1));
   return years.length ? String(Math.max(...years)) : '';
 }
 
-/** Remove duplicadas por arquivo/CAT nº */
-function uniqueByCat(metaList) {
+function uniqueByCat(metaList = []) {
   const seen = new Set();
   return (metaList || []).filter(m => {
     const key = `${m.nomeCAT}|${m.catNum || ''}|${m.fileName || ''}`;
@@ -303,8 +368,10 @@ function uniqueByCat(metaList) {
   });
 }
 
-/** Score orientado ao objeto + penalidades de domínio desalinhado (considera filename) */
-function scoreCatToObjetoLote(cat, objeto = '', lote = '') {
+/* =====================================================================
+ * SCORE OBJETO/LOTE e RT SUGERIDO
+ * ===================================================================== */
+function scoreCatToObjetoLote(cat = {}, objeto = '', lote = '') {
   const catTxt = (cat.raw || '').toLowerCase();
 
   const objSigs  = new Set(signaturesFor(objeto));
@@ -314,34 +381,41 @@ function scoreCatToObjetoLote(cat, objeto = '', lote = '') {
 
   let sc = 0;
 
-  // BÔNUS por casar domínios
-  for (const dom of objSigs) if (catSigs.has(dom)) sc += 4;
-  for (const dom of loteSigs) if (catSigs.has(dom)) sc += 2;
+  // domínios batendo – peso maior
+  for (const dom of objSigs) if (catSigs.has(dom)) sc += 8;
+  for (const dom of loteSigs) if (catSigs.has(dom)) sc += 4;
 
-  // Penalidade por conflitos
-  for (const dom of Object.keys(DOMAIN_LEXICON)) {
-    if (objSigs.size && !objSigs.has(dom) && catSigs.has(dom)) sc -= 5;
+  // penalidade por domínios intrusos
+  if (objSigs.size) {
+    for (const dom of Object.keys(DOMAIN_LEXICON)) {
+      if (!objSigs.has(dom) && catSigs.has(dom)) sc -= 7;
+    }
   }
 
-  // Metadados úteis
+  // metadados
   if (cat.hasART) sc += 2;
   if (cat.hasCREA) sc += 1;
   if (cat.mentionsManut) sc += 1;
   if (cat.mentionsObra) sc += 1;
 
-  // Recência
+  // recência
   const yr = Number(pickReasonableYear(cat.raw)) || Number(cat.fileHints?.fileYear) || 0;
   if (yr) sc += (yr - 2015) / 10;
 
-  // Afinidade de profissão
+  // leve afinidade de profissão
   if (/eletric/i.test(cat.titulo || '') && objSigs.has('eletrica')) sc += 1;
-  if (/mec[aâ]nic/i.test(cat.titulo || '') && objSigs.has('clima')) sc += 0.5;
+
+  // fallback por sobreposição de tokens quando não há domínio
+  if (objSigs.size === 0) {
+    const ov = tokenOverlapScore(objeto, catTxt);
+    sc += Math.min(ov, 4);
+    if (ov === 0) sc -= 5;
+  }
 
   return sc;
 }
 
-/** RT sugerido — pondera domínio/recência/metadados e respeita overlap */
-function suggestBestRT(catMatches, objetoHint = '') {
+function suggestBestRT(catMatches = [], objetoHint = '') {
   if (!catMatches?.length) return null;
 
   const pool = catMatches.filter(c => hasDomainOverlap(objetoHint, c.raw || '', c.fileName || ''));
@@ -354,7 +428,6 @@ function suggestBestRT(catMatches, objetoHint = '') {
       ...signaturesFor(c.raw || ''),
       ...(c.fileHints?.fileDomains || [])
     ]);
-    // domínios batendo
     for (const d of catDom) if (sObj.includes(d)) s += 2;
 
     if (/manuten[cç][aã]o|predial|edifica/i.test(objetoHint)) s += (c.mentionsManut ? 3 : 0) + (c.mentionsObra ? 1 : 0);
@@ -385,7 +458,9 @@ function suggestBestRT(catMatches, objetoHint = '') {
   } : null;
 }
 
-/** Parâmetros comparáveis (expansível) */
+/* =====================================================================
+ * COMPARAÇÃO DE PARÂMETROS (kVA, kV, TR, endereçável)
+ * ===================================================================== */
 function parseCaps(text = '') {
   const t = String(text || '').toLowerCase();
   const num = (re) => (t.match(re)?.[1] ? Number(t.match(re)[1]) : null);
@@ -396,6 +471,7 @@ function parseCaps(text = '') {
     enderecavel: /endere[cç]a[vv]el|endere[çc]ável/.test(t),
   };
 }
+
 function compareReqVsCat(reqText = '', catText = '') {
   const rq = parseCaps(reqText);
   const ct = parseCaps(catText);
@@ -424,25 +500,30 @@ function compareReqVsCat(reqText = '', catText = '') {
 
   if (rq.enderecavel) {
     const catLower = String(catText || '').toLowerCase();
-    if (/endere[cç]a[vv]el|endere[çc]ável/.test(catLower))
-      out.push(`✅ **igual**: sistema de alarme **endereçável** citado`);
-    else if (/convencional/.test(catLower))
-      out.push(`❌ **inferior**: CAT cita sistema **convencional**, edital exige **endereçável**`);
-    else
-      out.push(`⚠ exige **endereçável**, CAT não deixa explícito`);
+    if (/endere[cç]a[vv]el|endere[çc]ável/.test(catLower)) out.push('✅ **igual**: sistema de alarme **endereçável** citado');
+    else if (/convencional/.test(catLower)) out.push('❌ **inferior**: CAT cita sistema **convencional**, edital exige **endereçável**');
+    else out.push('⚠ exige **endereçável**, CAT não deixa explícito');
   }
 
   return out;
 }
 
+/* =====================================================================
+ * EXPORTS
+ * ===================================================================== */
 module.exports = {
+  // busca/principal
   findCATMatches,
+
+  // utilitários
   pickReasonableYear,
   uniqueByCat,
   scoreCatToObjetoLote,
   suggestBestRT,
   compareReqVsCat,
+
+  // extras úteis em outros módulos
   signaturesFor,
   DOMAIN_LEXICON,
-  hasDomainOverlap
+  hasDomainOverlap,
 };

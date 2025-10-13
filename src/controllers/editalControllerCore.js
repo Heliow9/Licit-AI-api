@@ -4,7 +4,7 @@ const PDFDocument = require('pdfkit');
 
 const { getDb } = require('../Config/db');
 const Companies = require('../models/companyModel');
-const { MAX_EDITALTEXT_CHARS } = require('../Config/env');
+const { MAX_EDITALTEXT_CHARS: MAX_CHARS_ENV } = require('../Config/env');
 const { extractTextFromPdf } = require('../utils/ocr');
 
 const {
@@ -19,25 +19,31 @@ const {
 } = require('../services/evidence');
 
 const {
-  findCATMatches,
+  findCATMatches,       // pode ser versão “premium” (Mongo/embeddings) ou “mínima”
   uniqueByCat,
   scoreCatToObjetoLote,
   pickReasonableYear,
   suggestBestRT,
   compareReqVsCat,
-  signaturesFor
+  signaturesFor,
 } = require('../services/cats');
 
 /* ====== diretório por empresa para salvar relatórios ====== */
 const REPORTS_BASE_DIR = path.join(process.cwd(), 'data', 'reports');
 const companyReportsDir = (companyId) => path.join(REPORTS_BASE_DIR, String(companyId || 'unknown'));
 
+/* ====== limites/config ====== */
+const MAX_EDITALTEXT_CHARS = Number(MAX_CHARS_ENV || 200000);
+
 /* ============================ PDF helpers ============================ */
 function cleanTextForPdf(text = '') {
   const zwsp = '\u200B';
-  return String(text)
+  return String(text || '')
+    // remove tags html simples
     .replace(/<[^>]+>/g, '')
+    // removes **bold** markup
     .replace(/\*\*(.*?)\*\*/g, '$1')
+    // quebra palavras gigantes (para não estourar linhas no pdfkit)
     .replace(/([A-Za-z0-9_/\\\-]{30,})/g, (m) => m.split('').join(zwsp));
 }
 
@@ -70,7 +76,7 @@ function renderMarkdownSimple(doc, markdown) {
       width: contentWidth,
       align: 'justify',
       lineGap: 2.6,
-      paragraphGap: 4.2
+      paragraphGap: 4.2,
     });
   };
 
@@ -81,7 +87,10 @@ function renderMarkdownSimple(doc, markdown) {
       doc.addPage();
       continue;
     }
-    if (/^\s*---\s*$/.test(ln)) { drawHr(); continue; }
+    if (/^\s*---\s*$/.test(ln)) {
+      drawHr();
+      continue;
+    }
     if (/^#\s+/.test(ln)) {
       doc.font('Helvetica-Bold').fontSize(18).text(ln.replace(/^#\s+/, ''), { width: contentWidth });
       doc.font('Helvetica').fontSize(11);
@@ -107,7 +116,7 @@ function renderMarkdownSimple(doc, markdown) {
         bulletRadius: 1.8,
         textIndent: 10,
         bulletIndent: 14,
-        width: contentWidth
+        width: contentWidth,
       });
       continue;
     }
@@ -131,16 +140,22 @@ async function gerarPdf(markdown, companyId) {
   const stream = fs.createWriteStream(outPath);
   doc.pipe(stream);
 
+  // Cabeçalho
   doc.font('Helvetica-Bold').fontSize(16).text('RELATÓRIO DE VIABILIDADE', { align: 'center' });
   doc.moveDown(0.35);
-  doc.font('Helvetica').fontSize(10).fillColor('#6b7280')
+  doc
+    .font('Helvetica')
+    .fontSize(10)
+    .fillColor('#6b7280')
     .text(`Emitido em: ${new Date().toLocaleString('pt-BR')}`, { align: 'center' })
     .fillColor('black');
   doc.moveDown(0.6);
 
+  // Conteúdo
   renderMarkdownSimple(doc, markdown);
 
   doc.end();
+
   await new Promise((resolve, reject) => {
     stream.on('finish', resolve);
     stream.on('error', reject);
@@ -149,26 +164,87 @@ async function gerarPdf(markdown, companyId) {
   return { filePath: outPath, publicUrl: `/api/edital/report/${filename}`, filename };
 }
 
+/* ======================= Compat: findCATMatches ======================= */
+/**
+ * Wrapper para usar findCATMatches em qualquer versão:
+ *  - Versão “premium”: findCATMatches({ catsCol, chunksCol }, textoAlvo, limit, localFiles, { companyId })
+ *  - Versão “mínima”:  findCATMatches(texto, patterns?)  → faz fallback para ranquear arquivos locais
+ */
+async function safeFindCATMatches(contextOrNull, textoAlvo, limit = 10, localFilesText = [], opts = {}) {
+  // Tentativa 1: assinatura “premium”
+  try {
+    if (contextOrNull && typeof findCATMatches === 'function') {
+      const maybe = await findCATMatches(contextOrNull, textoAlvo, limit, localFilesText, opts);
+      if (Array.isArray(maybe)) return maybe;
+    }
+  } catch (err) {
+    // cai para fallback
+  }
+
+  // Tentativa 2: assinatura “mínima” (ex.: findCATMatches(text, patterns))
+  try {
+    if (typeof findCATMatches === 'function') {
+      const maybe = await findCATMatches(textoAlvo, []); // patterns vazios → sem erro
+      if (Array.isArray(maybe)) {
+        // Mesmo assim, não temos CAT “meta”; ranquear locais:
+        return rankFromLocalOnly(textoAlvo, limit, localFilesText);
+      }
+    }
+  } catch (err) {
+    // cai para fallback
+  }
+
+  // Fallback final: ranquear apenas arquivos locais
+  return rankFromLocalOnly(textoAlvo, limit, localFilesText);
+}
+
+/** Ranquear “CATs” a partir dos próprios arquivos locais (texto bruto como meta) */
+function rankFromLocalOnly(textoAlvo, limit, localFilesText = []) {
+  const pool = [];
+  for (const f of localFilesText) {
+    if (!f?.text) continue;
+    const meta = {
+      raw: f.text,
+      escopo: f.text.slice(0, 1500),
+      nomeCAT: f.source || 'local',
+      fileName: f.source || 'local',
+      ano: pickReasonableYear(f.text) || '',
+      hasART: /(^|\W)ART(\W|$)/i.test(f.text),
+      hasCREA: /(^|\W)CREA|CAU(\W|$)/i.test(f.text),
+      orgao: null,
+      catNum: null,
+    };
+    const score = scoreCatToObjetoLote(meta, textoAlvo, '');
+    pool.push({ meta, score });
+  }
+  return pool
+    .sort((a, b) => b.score - a.score)
+    .slice(0, limit)
+    .map((p) => p.meta);
+}
+
 /* ===================== helper de ranking por lote ===================== */
 async function rankCatsFor(textoAlvo, opts) {
-  const { catsCol, chunksCol, localFilesText, companyId } = opts;
-  const raw = await findCATMatches(
+  const { catsCol, chunksCol, localFilesText, companyId } = opts || {};
+  const raw = await safeFindCATMatches(
     (catsCol || chunksCol) ? { catsCol, chunksCol } : null,
-    textoAlvo,
+    textoAlvo || '',
     10,
-    localFilesText,
+    localFilesText || [],
     { companyId }
   );
 
-  const dedup = uniqueByCat(raw).map(c => ({
+  const dedup = uniqueByCat(raw || []).map((c) => ({
     ...c,
-    ano: pickReasonableYear(c.raw) || c.ano || ''
+    ano: pickReasonableYear(c.raw) || c.ano || '',
   }));
 
-  const ranked = dedup.map(c => ({
-    meta: c,
-    score: scoreCatToObjetoLote(c, textoAlvo, '')
-  })).sort((a, b) => b.score - a.score);
+  const ranked = dedup
+    .map((c) => ({
+      meta: c,
+      score: scoreCatToObjetoLote(c, textoAlvo || '', ''),
+    }))
+    .sort((a, b) => b.score - a.score);
 
   return ranked.slice(0, 3);
 }
@@ -176,55 +252,77 @@ async function rankCatsFor(textoAlvo, opts) {
 /* ============================ CORE ============================ */
 async function analisarEditalCore(files, onProgress = () => {}, opts = {}) {
   const { companyId } = opts || {};
-  const bump = (pct, phase) => { try { onProgress(pct, phase); } catch {} };
+  const bump = (pct, phase) => {
+    try { onProgress(pct, phase); } catch (_) {}
+  };
 
-  // Mongo (acesso a cats + chunks)
+  // Mongo (acesso a cats + chunks) — opcional
   let catsCol = null;
   let chunksCol = null;
   try {
     const db = await getDb();
-    catsCol = db.collection('cats');     // <- CATs completas
-    chunksCol = db.collection('chunks'); // <- OCR/embeddings
-  } catch {}
+    if (db) {
+      catsCol = db.collection('cats');     // CATs completas
+      chunksCol = db.collection('chunks'); // OCR/embeddings
+    }
+  } catch (_) {
+    // sem DB → seguimos com fallback
+  }
 
-  // Perfil empresa
+  // Perfil empresa — opcional
   let companyProfile = null;
   if (companyId) {
     try {
       companyProfile = await Companies.findById(companyId);
-    } catch {}
+    } catch (_) {}
   }
 
-  const mainEditalFile = files.mainEditalFile;
-  const annexFiles = files.annexFiles || [];
-  const allFiles = [mainEditalFile, ...annexFiles];
+  const mainEditalFile = files?.mainEditalFile;
+  const annexFiles = files?.annexFiles || [];
+  const allFiles = [mainEditalFile, ...annexFiles].filter(Boolean);
+
+  if (!mainEditalFile?.path) {
+    throw new Error('Arquivo principal do edital não informado.');
+  }
 
   try {
+    /* ========== OCR do edital principal ========== */
     const rawPdf = fs.readFileSync(mainEditalFile.path);
     const mainText = await extractTextFromPdf(rawPdf, mainEditalFile.path);
     if (!mainText?.trim()) throw new Error('Falha ao extrair texto do edital.');
-    const editalText = mainText.slice(0, MAX_EDITALTEXT_CHARS || 200000);
+    const editalText = mainText.slice(0, MAX_EDITALTEXT_CHARS);
     bump(15, 'OCR do edital');
 
-    // arquivos locais para evidências
+    /* ========== OCR de todos arquivos locais (para evidências/fallback) ========== */
     const localFilesText = [];
     for (const f of allFiles) {
       try {
         const txt = await extractTextFromPdf(fs.readFileSync(f.path), f.path);
-        localFilesText.push({ source: f.originalname, text: txt || '' });
-      } catch {}
+        localFilesText.push({ source: f.originalname || path.basename(f.path), text: txt || '' });
+      } catch (_) {
+        // segue
+      }
     }
     bump(25, 'Textos locais prontos');
 
-    // header simplificado
+    /* ========== Cabeçalho simplificado ========== */
     const T = editalText;
-    const take = (rx, max = 1200) => (T.match(rx) ? String(T.match(rx)[0]).slice(0, max) : '');
-    const objetoBlock = take(/(?:\bDO?\s+OBJETO\b[\s\S]{0,2000})|(?:\bOBJETO\b[\s\S]{0,2000})/i, 2000);
+    const take = (rx, max = 1200) => {
+      const m = T.match(rx);
+      return m ? String(m[0]).slice(0, max) : '';
+    };
 
+    // Pega do bloco “OBJETO” (ou primeiras linhas se não achar)
+    const objetoBlock =
+      take(/(?:\bDO?\s+OBJETO\b[\s\S]{0,2000})|(?:\bOBJETO\b[\s\S]{0,2000})/i, 2000) ||
+      T.slice(0, 2000);
+
+    // Pega Lotes (até 6 linhas)
     const lotesSnippet = (() => {
       const lotes = [];
       const rx = /(?:^|\n)\s*(?:LOTE|Lote)\s*(\d+)\s*[:\-–]\s*([\s\S]{0,300})/gi;
-      let m; let cap = 0;
+      let m;
+      let cap = 0;
       while ((m = rx.exec(T)) && cap < 6) {
         lotes.push(`Lote ${m[1]}: ${m[2].trim().replace(/\s+/g, ' ')}`);
         cap++;
@@ -233,15 +331,15 @@ async function analisarEditalCore(files, onProgress = () => {}, opts = {}) {
     })();
 
     const header = {
-      objetoLicitado: (objetoBlock || '').trim() || T.slice(0, 2000),
-      resumoLotes: lotesSnippet
+      objetoLicitado: String(objetoBlock || '').trim(),
+      resumoLotes: lotesSnippet,
     };
     bump(30, 'Cabeçalho extraído');
 
     /* ========== Busca global de CATs (objeto + lotes) ========== */
     const domainProbe = [header.objetoLicitado, header.resumoLotes].filter(Boolean).join('\n') || editalText;
 
-    const allCatsRaw = await findCATMatches(
+    const allCatsRaw = await safeFindCATMatches(
       (catsCol || chunksCol) ? { catsCol, chunksCol } : null,
       domainProbe,
       15,
@@ -249,25 +347,27 @@ async function analisarEditalCore(files, onProgress = () => {}, opts = {}) {
       { companyId }
     );
 
-    const dedupCats = uniqueByCat(allCatsRaw).map(c => ({
+    const dedupCats = uniqueByCat(allCatsRaw || []).map((c) => ({
       ...c,
-      ano: pickReasonableYear(c.raw) || c.ano || ''
+      ano: pickReasonableYear(c.raw) || c.ano || '',
     }));
 
     const objetoBase = [header.objetoLicitado, header.resumoLotes].filter(Boolean).join('\n') || editalText;
-    const preRank = dedupCats.map(c => ({
+
+    const preRank = dedupCats.map((c) => ({
       meta: c,
-      score: scoreCatToObjetoLote(c, objetoBase, '')
+      score: scoreCatToObjetoLote(c, objetoBase, ''),
     }));
-    const rankedCats = preRank.sort((a,b)=>b.score - a.score).slice(0,5);
-    const topCats = rankedCats.map(r=>r.meta);
-    const domainAligned = rankedCats.some(r=>r.score>=7);
+
+    const rankedCats = preRank.sort((a, b) => b.score - a.score).slice(0, 5);
+    const topCats = rankedCats.map((r) => r.meta);
+    const domainAligned = rankedCats.some((r) => (r.score || 0) >= 0.35); // limiar suavizado 0–1
     bump(60, 'CATs selecionadas');
 
-    // Análise de requisitos
+    /* ========== Análise de requisitos ========== */
     const allRequirements = await extractRequirementsFromBid(editalText);
-    const requirementsToAnalyze = (allRequirements || []).filter(r =>
-      !/credenciamento|chave|senha|licitanet|comprasnet|bll|enviar proposta/i.test(r || '')
+    const requirementsToAnalyze = (allRequirements || []).filter(
+      (r) => !/credenciamento|chave|senha|licitanet|comprasnet|bll|enviar proposta/i.test(r || '')
     );
 
     const detailedAnalyses = [];
@@ -277,20 +377,26 @@ async function analisarEditalCore(files, onProgress = () => {}, opts = {}) {
     const maxScore = rankedCats[0]?.score || 1;
 
     for (const reqTxt of requirementsToAnalyze) {
-      const isTech = TECH_REQ_RX.test(reqTxt.toLowerCase());
+      const isTech = TECH_REQ_RX.test((reqTxt || '').toLowerCase());
       if (isTech) {
         if (topCats.length > 0) {
-          const bullets = rankedCats.map(r => {
-            const c = r.meta;
-            const tags = [c.catNum ? `CAT nº ${c.catNum}` : null, c.hasART ? 'ART' : null, c.hasCREA ? 'CREA/CAU' : null]
-              .filter(Boolean).join(' · ');
-            const conf = Math.round(Math.min(97, Math.max(55, (r.score / maxScore) * 100)));
-            return `- ${c.nomeCAT}${c.ano ? ` (${c.ano})` : ''} — ${tags || '—'} — **conf.: ${conf}%**`;
-          }).join('\n');
+          const bullets = rankedCats
+            .map((r) => {
+              const c = r.meta || {};
+              const tags = [c.catNum ? `CAT nº ${c.catNum}` : null, c.hasART ? 'ART' : null, c.hasCREA ? 'CREA/CAU' : null]
+                .filter(Boolean)
+                .join(' · ');
+              const conf = Math.round(
+                Math.min(97, Math.max(55, ((r.score || 0.01) / (maxScore || 1)) * 100))
+              );
+              return `- ${c.nomeCAT || c.fileName || '(CAT)'}${c.ano ? ` (${c.ano})` : ''} — ${tags || '—'} — **conf.: ${conf}%**`;
+            })
+            .join('\n');
 
           const status = domainAligned ? '🟢 ATENDIDO.' : '🟡 ATENDIDO PARCIALMENTE.';
-          detailedAnalyses.push(`Requisito: ${reqTxt}\n\n${status}\n\n${bullets}`);
-          techBlocks.push(reqTxt);
+          const block = `Requisito: ${reqTxt}\n\n${status}\n\n${bullets || '- (sem CATs listadas)'}`;
+          detailedAnalyses.push(block);
+          techBlocks.push(block);
         } else {
           const block = `Requisito: ${reqTxt}\n\n🔴 **NÃO ATENDIDO** — Sem CATs aderentes.`;
           detailedAnalyses.push(block);
@@ -298,8 +404,9 @@ async function analisarEditalCore(files, onProgress = () => {}, opts = {}) {
         }
       } else {
         let block;
-        if (companyProfile) block = await analyzeRequirementWithContext(reqTxt, null, companyProfile);
-        else {
+        if (companyProfile) {
+          block = await analyzeRequirementWithContext(reqTxt, null, companyProfile);
+        } else {
           const evidence = await findEvidenceOnTheFly(reqTxt, localFilesText, chunksCol);
           block = await analyzeRequirementWithContext(reqTxt, evidence, null);
         }
@@ -309,12 +416,24 @@ async function analisarEditalCore(files, onProgress = () => {}, opts = {}) {
     }
 
     /* ======= Viabilidade Técnica ======= */
-    const blocoViabilidade = (topCats.length
-      ? `### Viabilidade profissional e técnica\n\nCom base no acervo (CATs), identificamos ${domainAligned ? '**aderência técnica direta**' : '**aderência parcial**'}:\n\n${topCats.map(c => {
-          const comp = [c.catNum ? `CAT nº ${c.catNum}` : null, c.hasART ? 'ART' : null, c.hasCREA ? 'CREA/CAU' : null].filter(Boolean).join(' · ');
-          return `- ${c.nomeCAT} | ${c.orgao || '-'} | ${c.ano || '-'}\n  - **Escopo:** ${c.escopo}\n  - **Comprovações:** ${comp || '—'}`;
-        }).join('\n\n')}`
-      : '### Viabilidade profissional e técnica\n\n- Nenhuma CAT aderente encontrada.');
+    const blocoViabilidade = topCats.length
+      ? `### Viabilidade profissional e técnica
+
+Com base no acervo (CATs), identificamos ${
+          domainAligned ? '**aderência técnica direta**' : '**aderência parcial**'
+        }:
+
+${topCats
+  .map((c) => {
+    const comp = [c.catNum ? `CAT nº ${c.catNum}` : null, c.hasART ? 'ART' : null, c.hasCREA ? 'CREA/CAU' : null]
+      .filter(Boolean)
+      .join(' · ');
+    return `- ${c.nomeCAT || c.fileName || '(CAT)'} | ${c.orgao || '-'} | ${c.ano || '-'}
+  - **Escopo:** ${c.escopo ? String(c.escopo).slice(0, 600) : '-'}
+  - **Comprovações:** ${comp || '—'}`;
+  })
+  .join('\n\n')}`
+      : '### Viabilidade profissional e técnica\n\n- Nenhuma CAT aderente encontrada.';
 
     /* ======= Lotes: aderência individual ======= */
     const lotesAnalise = [];
@@ -323,38 +442,47 @@ async function analisarEditalCore(files, onProgress = () => {}, opts = {}) {
       for (const linha of lotes) {
         const top = await rankCatsFor(linha, { catsCol, chunksCol, localFilesText, companyId });
         const max = top[0]?.score || 1;
+        const bullets =
+          top
+            .map((r) => {
+              const c = r.meta || {};
+              const conf = Math.round(Math.min(97, Math.max(55, ((r.score || 0.01) / (max || 1)) * 100)));
+              const tags = [c.catNum ? `CAT nº ${c.catNum}` : null, c.hasART ? 'ART' : null, c.hasCREA ? 'CREA/CAU' : null]
+                .filter(Boolean)
+                .join(' · ');
+              return `- ${c.nomeCAT || c.fileName || '(CAT)'}${c.ano ? ` (${c.ano})` : ''} — ${tags || '—'} — **conf.: ${conf}%**`;
+            })
+            .join('\n') || '- (sem CATs aderentes)';
         lotesAnalise.push({
           titulo: linha.replace(/^\s*Lote\s*\d+\s*[:\-–]\s*/i, '').trim(),
-          bullets: top.map(r => {
-            const c = r.meta;
-            const conf = Math.round(Math.min(97, Math.max(55, (r.score / max) * 100)));
-            const tags = [c.catNum ? `CAT nº ${c.catNum}` : null, c.hasART ? 'ART' : null, c.hasCREA ? 'CREA/CAU' : null].filter(Boolean).join(' · ');
-            return `- ${c.nomeCAT}${c.ano ? ` (${c.ano})` : ''} — ${tags || '—'} — **conf.: ${conf}%**`;
-          }).join('\n') || '- (sem CATs aderentes)'
+          bullets,
         });
       }
     }
 
     const blocoLotes = lotesAnalise.length
-      ? ['## Aderência por Lote', ...lotesAnalise.map(l => `### ${l.titulo}\n${l.bullets}`)].join('\n\n')
+      ? ['## Aderência por Lote', ...lotesAnalise.map((l) => `### ${l.titulo}\n${l.bullets}`)].join('\n\n')
       : '';
 
     // RT sugerido (baseado no objeto geral)
     let blocoRT = '';
     if (topCats.length) {
-      const rtSugerido = suggestBestRT(topCats, header.objetoLicitado || editalText);
+      const rtSugerido = suggestBestRT(
+        topCats.map((c) => ({ profissional: c.profissional || c.titular || '—', conselho: c.conselho || c.orgao, cat: c })),
+        header.objetoLicitado || editalText
+      );
       if (rtSugerido) {
-        const chosenCat = topCats.find(c => c.nomeCAT === rtSugerido.arquivo) || topCats[0];
+        const chosenCat = topCats[0];
         const comp = compareReqVsCat([header.objetoLicitado, header.resumoLotes].filter(Boolean).join('\n'), chosenCat?.raw || '');
         blocoRT = [
           '### Responsável Técnico Sugerido',
-          `**Nome:** ${rtSugerido.profissional}`,
-          `**CAT nº / Ano / Órgão:** ${rtSugerido.catNum} / ${rtSugerido.ano} / ${rtSugerido.orgao}`,
-          `**Escopo (resumo):** ${rtSugerido.escopo}`,
-          `**Fonte (arquivo):** ${rtSugerido.arquivo}`,
+          `**Nome:** ${rtSugerido.profissional || '—'}`,
+          `**CAT nº / Ano / Órgão:** ${chosenCat?.catNum || '—'} / ${chosenCat?.ano || '—'} / ${chosenCat?.orgao || '—'}`,
+          `**Escopo (resumo):** ${chosenCat?.escopo ? String(chosenCat.escopo).slice(0, 600) : '—'}`,
+          `**Fonte (arquivo):** ${chosenCat?.nomeCAT || chosenCat?.fileName || '—'}`,
           '',
           '#### Comprovação frente ao edital',
-          (comp.length ? comp.map(l => `- ${l}`).join('\n') : '- (Sem parâmetros comparáveis explícitos)')
+          comp.length ? comp.map((l) => `- ${l}`).join('\n') : '- (Sem parâmetros comparáveis explícitos)',
         ].join('\n\n');
       }
     }
@@ -381,18 +509,27 @@ async function analisarEditalCore(files, onProgress = () => {}, opts = {}) {
       summary,
       '[[PAGE_BREAK]]',
       '## Análise Detalhada',
-      detailedAnalyses.join('\n\n---\n\n') || '- (não gerado)'
+      detailedAnalyses.join('\n\n---\n\n') || '- (não gerado)',
     ].join('\n\n');
 
     const { publicUrl, filePath, filename } = await gerarPdf(finalReport, companyId);
     bump(100, 'PDF emitido');
 
-    for (const f of allFiles) { try { fs.existsSync(f.path) && fs.unlinkSync(f.path); } catch {} }
+    // limpar arquivos temporários
+    for (const f of allFiles) {
+      try {
+        if (f?.path && fs.existsSync(f.path)) fs.unlinkSync(f.path);
+      } catch (_) {}
+    }
 
     return { report: finalReport, pdf: { filename, url: publicUrl, path: filePath } };
   } catch (err) {
     console.error('[analisarEditalCore] erro:', err);
-    for (const f of allFiles) { try { fs.existsSync(f.path) && fs.unlinkSync(f.path); } catch {} }
+    for (const f of allFiles) {
+      try {
+        if (f?.path && fs.existsSync(f.path)) fs.unlinkSync(f.path);
+      } catch (_) {}
+    }
     throw err;
   }
 }

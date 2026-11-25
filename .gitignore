@@ -1,5 +1,8 @@
 # Ignorar pasta data na raiz
 /data/
+/uploads/
+/tmp/
+/temp/
 
 # Ignorar dependências do Node (qualquer nível)
 node_modules/

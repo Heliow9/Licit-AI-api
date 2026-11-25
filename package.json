@@ -6,35 +6,35 @@
   "scripts": {
     "start": "node src/server.js",
     "dev": "nodemon src/server.js",
-    "db:indexes": "node scripts/create_indexes.js",
-    "db:migrate:cats": "node scripts/migrate_cats_normalize.js",
-    "db:migrate:cats:dry": "node scripts/migrate_cats_normalize.js --dry",
-    "db:migrate:cats:since": "node scripts/migrate_cats_normalize.js --since 2025-09-01",
-    "db:migrate:cats:limit": "node scripts/migrate_cats_normalize.js --limit 2000"
+    "test": "node --test test/*.test.js",
+    "db:init": "node scripts/init-db.js"
   },
   "keywords": [
     "ia",
     "licitacao",
     "gemini",
-    "mongodb"
+    "mysql"
   ],
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "@azure-rest/ai-document-intelligence": "^1.1.0",
     "@azure/openai": "^2.0.0",
     "@google/generative-ai": "^0.24.1",
     "bcryptjs": "^3.0.2",
     "cors": "^2.8.5",
     "dotenv": "^17.2.2",
+    "execa": "^9.6.0",
     "express": "^4.19.2",
     "jsonwebtoken": "^9.0.2",
-    "mongodb": "^6.20.0",
     "multer": "^2.0.2",
+    "node-tesseract-ocr": "^2.2.1",
     "openai": "^5.20.2",
     "pdf-image": "^2.0.0",
     "pdf-parse": "^1.1.1",
     "pdfkit": "^0.17.2",
-    "tesseract.js": "^6.0.1"
+    "tesseract.js": "^6.0.1",
+    "mysql2": "^3.15.3"
   },
   "devDependencies": {
     "nodemon": "^3.1.10"

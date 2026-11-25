@@ -9,198 +9,251 @@ const {
   OCR_MAX_PAGES,
   AZURE_DOCINTELLIGENCE_ENDPOINT,
   AZURE_DOCINTELLIGENCE_KEY,
-  AZURE_DOCINTELLIGENCE_API_VERSION,
+  AZURE_DOCINTELLIGENCE_API_VERSION, // pode deixar vazio para autodetect
+  AZURE_READ_RPM,
+  AZURE_OCR_BLOCK_PAGES,
+  AZURE_POLL_MIN_SEC,
+  AZURE_POLL_MAX_SEC, // não usado diretamente no SDK, mas mantido p/ compat
 } = require('../Config/env');
 
 const TEMP_PATH = path.join(__dirname, '..', '..', 'temp');
 if (!fs.existsSync(TEMP_PATH)) fs.mkdirSync(TEMP_PATH);
 
-/* ========================= Helpers ========================= */
-function maskKey(k = '') {
-  if (!k) return '';
-  return k.length <= 8 ? '****' : `${k.slice(0, 4)}****${k.slice(-4)}`;
+/* ========================= Utils ========================= */
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+function normEndpoint(e = '') { return String(e || '').replace(/\/+$/, ''); }
+function hasTextEnough(t = '') { return (t || '').trim().length >= 450; }
+function countPdfMarkers(pdfBuffer) {
+  const slice = pdfBuffer.slice(0, Math.min(pdfBuffer.length, 2_000_000));
+  const s = slice.toString('latin1');
+  const count = (re) => (s.match(re) || []).length;
+  const nFont = count(/\/Font/gi) + count(/\bTj\b/g) + count(/\bTJ\b/g);
+  const nImg  = count(/\/Image/gi) + count(/\bDo\b/g);
+  return { nFont, nImg };
 }
-function normEndpoint(e = '') {
-  return String(e || '').replace(/\/+$/, '');
+function isLikelyImageOnlyPdf(pdfBuffer) {
+  const { nFont, nImg } = countPdfMarkers(pdfBuffer);
+  if (nFont <= 2 && nImg >= 2) return true;
+  if (nFont === 0 && nImg >= 1) return true;
+  return false;
 }
-function hasTextEnough(t = '') {
-  return (t || '').trim().length >= 450; // ajuste se quiser
+function hasManyImages(pdfBuffer) { return countPdfMarkers(pdfBuffer).nImg >= 2; }
+
+/* ========================= Rate limit (analyze) ========================= */
+// Limite simples por processo: N chamadas de ANALYZE por minuto
+const _rate = {
+  rpm: Math.max(1, Number(AZURE_READ_RPM || 1)),
+  lastAnalyzeAt: 0
+};
+async function rateGate(label = '') {
+  const minIntervalMs = Math.ceil(60_000 / _rate.rpm);
+  const now = Date.now();
+  const wait = _rate.lastAnalyzeAt + minIntervalMs - now;
+  if (wait > 0) {
+    const secs = Math.ceil(wait / 1000);
+    console.log(`[azureReadExtract][rate] aguardando ${secs}s ${label}`);
+    await sleep(wait);
+  }
+  _rate.lastAnalyzeAt = Date.now();
+}
+
+/* ============ Azure Document Intelligence (SDK) ============ */
+const createDocIntel = require('@azure-rest/ai-document-intelligence').default;
+const { getLongRunningPoller, isUnexpected } = require('@azure-rest/ai-document-intelligence');
+
+let _sdkClientCache = new Map();
+function getSdkClient(endpoint, key, apiVersion) {
+  const k = `${endpoint}|${apiVersion}`;
+  if (_sdkClientCache.has(k)) return _sdkClientCache.get(k);
+  const c = createDocIntel(endpoint, { key, apiVersion });
+  _sdkClientCache.set(k, c);
+  return c;
 }
 
 /**
- * Heurística baratíssima para detectar PDF “imagem-only”:
- * - Conta ocorrências de marcadores típicos de texto (/Font, Tj, TJ)
- * - Compara com ocorrências de imagem (/Image, Do)
- * Retorna true se parecer escaneado (sem texto real).
+ * OCR com modelo prebuilt-read usando **sempre o SDK**:
+ *  - Se `url` existir → usa urlSource (JSON)
+ *  - Caso contrário → envia `bin` (Buffer) com contentType octet-stream
+ *  - Tenta múltiplas apiVersions até funcionar
+ *
+ * @param {Buffer|null} bin
+ * @param {Object} opts
+ *   - mime: string (default 'application/pdf')
+ *   - pages: "1-5" | "7"
+ *   - url: string (SAS/URL pública)
+ *   - locale: string (default 'pt-BR')
+ *   - readingOrder: 'natural' | 'basic' (default 'natural')
+ * @returns {Promise<string>} texto extraído
  */
-function isLikelyImageOnlyPdf(pdfBuffer) {
-  // limitamos leitura a 2MB pra não custar RAM
-  const slice = pdfBuffer.slice(0, Math.min(pdfBuffer.length, 2_000_000));
-  const s = slice.toString('latin1');
+async function azureReadExtract(bin, opts = {}) {
+  const {
+    mime = 'application/pdf',
+    pages,
+    url,
+    locale = 'pt-BR',
+    readingOrder = 'natural'
+  } = opts;
 
-  const count = (re) => (s.match(re) || []).length;
-
-  const nFont = count(/\/Font/gi) + count(/\bTj\b/g) + count(/\bTJ\b/g);
-  const nImg  = count(/\/Image/gi) + count(/\bDo\b/g);
-
-  // se tem MUITO mais imagem do que texto, é escaneado
-  // e se praticamente não tem marcadores de texto
-  if (nFont <= 2 && nImg >= 2) return true;
-  if (nFont === 0 && nImg >= 1) return true;
-
-  // fallback conservador
-  return false;
-}
-
-/* ========================= Azure Document Intelligence (Read) ========================= */
-async function azureReadExtract(pdfBuffer, mime = 'application/pdf') {
   const endpoint = normEndpoint(AZURE_DOCINTELLIGENCE_ENDPOINT);
   const key = AZURE_DOCINTELLIGENCE_KEY;
-  const apiVersion = AZURE_DOCINTELLIGENCE_API_VERSION || '2023-10-31';
+  if (!endpoint || !key) throw new Error('Azure OCR: configuração ausente (endpoint/key).');
 
-  if (!endpoint || !key) {
-    throw new Error('Azure OCR: configuração ausente (endpoint/key).');
-  }
+  const pageLimit = Math.max(1, Number(OCR_MAX_PAGES) || 15);
+  const pagesParam = pages ? String(pages) : `1-${pageLimit}`;
 
-  // limite de páginas por custo
-  const pageLimit = Math.max(1, Number(OCR_MAX_PAGES) || 8);
-  const pagesParam = `pages=1-${pageLimit}`;
+  await rateGate(`[prebuilt-read ${pagesParam}]`);
 
-  const basePaths = ['documentintelligence', 'formrecognizer']; // novo e legado
-  const headerVariants = [
-    (k) => ({ 'Ocp-Apim-Subscription-Key': k, 'Content-Type': mime }),
-    (k) => ({ 'api-key': k, 'Content-Type': mime }),
-  ];
+  const pollMin = Math.max(3, Number(AZURE_POLL_MIN_SEC || 6));
+
+  // Ordem de tentativa (a 1ª é a do .env se houver)
+  const envV = (AZURE_DOCINTELLIGENCE_API_VERSION || '').trim();
+  const tryVersions = Array.from(new Set([
+    envV || '2024-11-30',
+    '2024-02-29-preview',
+    '2023-10-31',
+    '2023-07-31',
+    '2022-08-31',
+  ])).filter(Boolean);
 
   let lastErr = null;
 
-  for (const base of basePaths) {
-    for (const headerBuilder of headerVariants) {
-      try {
-        const analyzeUrl =
-          `${endpoint}/${base}/documentModels/prebuilt-read:analyze?api-version=${apiVersion}&${pagesParam}`;
+  for (const apiVersion of tryVersions) {
+    try {
+      const client = getSdkClient(endpoint, key, apiVersion);
+      const route = client.path('/documentModels/{modelId}:analyze', 'prebuilt-read');
 
-        console.log(`[azureReadExtract] POST ${analyzeUrl} (key=${maskKey(key)})`);
-
-        const res = await fetch(analyzeUrl, {
-          method: 'POST',
-          headers: headerBuilder(key),
-          body: pdfBuffer,
-        });
-
-        if (res.status === 401) {
-          const body = await res.text().catch(() => '');
-          console.warn(`[azureReadExtract] 401 ${base}/${Object.keys(headerBuilder(key))[0]} → ${body.slice(0, 200)}`);
-          lastErr = new Error('401');
-          continue;
-        }
-        if (!res.ok && res.status !== 202) {
-          const body = await res.text().catch(() => '');
-          throw new Error(`Azure analyze HTTP ${res.status} - ${body.slice(0, 300)}`);
-        }
-
-        const opLoc = res.headers.get('operation-location') || res.headers.get('Operation-Location');
-        if (!opLoc) {
-          const body = await res.text().catch(() => '');
-          throw new Error(`Sem Operation-Location. HTTP ${res.status} - ${body.slice(0, 200)}`);
-        }
-
-        // polling
-        for (let tries = 0; tries < 60; tries++) {
-          await new Promise(r => setTimeout(r, 1000));
-          const pr = await fetch(opLoc, { headers: headerBuilder(key) });
-
-          if (pr.status === 401) {
-            const body = await pr.text().catch(() => '');
-            console.warn(`[azureReadExtract] Poll 401 ${base}/${Object.keys(headerBuilder(key))[0]} → ${body.slice(0, 200)}`);
-            lastErr = new Error('401-poll');
-            break;
-          }
-          if (!pr.ok) {
-            const body = await pr.text().catch(() => '');
-            throw new Error(`Azure poll HTTP ${pr.status} - ${body.slice(0, 300)}`);
-          }
-          const jr = await pr.json();
-          const status = jr.status || jr.analyzeResult?.status || jr?.result?.status;
-
-          if (status === 'succeeded') {
-            const ar = jr.analyzeResult || jr.result || jr;
-            let text = '';
-
-            if (ar?.content) {
-              text = ar.content; // novo
-            } else if (Array.isArray(ar?.pages)) {
-              const parts = [];
-              for (const p of ar.pages) {
-                if (Array.isArray(p.lines)) {
-                  for (const ln of p.lines) if (ln.content) parts.push(ln.content);
-                }
-              }
-              text = parts.join('\n');
+      // Com URL (igual ao quickstart) ou com Buffer binário
+      const postArgs = url
+        ? {
+            contentType: 'application/json',
+            body: {
+              urlSource: url,
+              parameters: { pages: pagesParam, locale, readingOrder }
             }
-            return normalizeSpaces(text || '');
           }
-          if (status === 'failed') {
-            throw new Error(`Azure status=failed: ${JSON.stringify(jr).slice(0, 400)}`);
-          }
-          // running → segue
-        }
+        : {
+            contentType: mime || 'application/octet-stream',
+            body: bin,
+            // para binário, os parâmetros vão na query
+            queryParameters: { pages: pagesParam, locale, readingOrder }
+          };
 
-        throw new Error('Azure poll timeout.');
-      } catch (err) {
-        console.warn(`[azureReadExtract] tentativa falhou (${base}/${Object.keys(headerBuilder(key))[0]}): ${err.message}`);
-        lastErr = err;
+      console.log(`[azureReadExtract][SDK] analyze api=${apiVersion} pages=${pagesParam} url=${!!url} mime=${mime}`);
+
+      const initial = await route.post(postArgs);
+
+      if (isUnexpected(initial)) {
+        const errBody = initial.body?.error || initial.body || {};
+        throw new Error(`${initial.status}: ${JSON.stringify(errBody).slice(0,300)}`);
       }
+
+      const poller = getLongRunningPoller(client, initial);
+      poller.intervalInMs = pollMin * 1000;
+
+      const done = await poller.pollUntilDone();
+      const ar = done.body?.analyzeResult;
+      if (!ar) throw new Error('Analyze retornou sem analyzeResult');
+
+      if (ar.content) return normalizeSpaces(ar.content);
+
+      const parts = [];
+      for (const p of (ar.pages || [])) for (const ln of (p.lines || [])) if (ln.content) parts.push(ln.content);
+      return normalizeSpaces(parts.join('\n'));
+    } catch (e) {
+      lastErr = e;
+      console.warn(`[azureReadExtract][SDK] falhou em api-version=${apiVersion}: ${String(e.message || e).slice(0,200)}`);
+      // tenta próxima versão
     }
   }
 
-  if (lastErr) throw lastErr;
-  throw new Error('Azure OCR falhou por motivo desconhecido.');
+  throw new Error(`Azure Read falhou em todas as versões (${tryVersions.join(', ')}): ${String(lastErr && lastErr.message || lastErr)}`);
 }
 
-/* ========================= Fluxo principal: PDF ========================= */
+/* ========================= Fluxo principal: PDF (blocos) ==================== */
 async function extractTextFromPdf(pdfBuffer, filePath) {
-  // 1) tenta texto nativo (barato)
+  let parsedText = '';
+  let numpages = 0;
+
   try {
     const data = await pdfParse(pdfBuffer);
-    const text = normalizeSpaces(data.text || '');
-
-    // Se tem “bastante” texto → já retorna e NÃO faz OCR
-    if (hasTextEnough(text)) return text;
-
-    // Se tem pouco texto mas o PDF NÃO é imagem-only → evita OCR pra reduzir custo
-    if (!isLikelyImageOnlyPdf(pdfBuffer)) {
-      if (text && text.trim().length > 0) {
-        return text; // retorna o pouco que tiver, mas não chama Azure
-      }
-      // ainda sem texto? se OCR não estiver habilitado, retorna vazio
-      if (!OCR_ENABLED) return '';
-      // com OCR habilitado, só cai no Azure se for imagem-only (abaixo)
-    }
+    parsedText = normalizeSpaces(data.text || '');
+    numpages = Number(data.numpages || data.numrender) || 0;
   } catch (e) {
     console.error('[extractTextFromPdf] Falha no pdf-parse:', filePath || '(buffer)', e.message);
-    // se pdf-parse falhar, ainda podemos decidir por OCR se for imagem-only
   }
 
-  // 2) Se OCR habilitado e PDF parece imagem-only → Azure (páginas limitadas)
-  if (OCR_ENABLED && isLikelyImageOnlyPdf(pdfBuffer)) {
+  // Se já há bastante texto e OCR off
+  if (hasTextEnough(parsedText) && !OCR_ENABLED) return parsedText;
+
+  // Decide se vamos de híbrido/blocos
+  const looksImageOnly = isLikelyImageOnlyPdf(pdfBuffer) || hasManyImages(pdfBuffer);
+  const shouldOcr = OCR_ENABLED && (looksImageOnly || !hasTextEnough(parsedText));
+  if (!shouldOcr) return parsedText || '';
+
+  // OCR por blocos (respeitando RPM e OCR_MAX_PAGES)
+  const rawBlock = Math.max(1, Number(AZURE_OCR_BLOCK_PAGES || 5));
+  const totalPages = Math.max(numpages || 0, 1);
+  const capByMax = Math.max(1, Math.min(totalPages, Number(OCR_MAX_PAGES) || totalPages));
+  const blockSize = Math.min(rawBlock, capByMax);
+  const chunks = [];
+
+  // Se não temos numpages, tenta uma chamada única
+  if (!numpages) {
     try {
-      console.log('[extractTextFromPdf] PDF parece escaneado → Azure OCR');
-      const text = await azureReadExtract(pdfBuffer, 'application/pdf');
-      return text || '';
+      console.log('[extractTextFromPdf] OCR (numpages desconhecido) em chamada única');
+      const t = await azureReadExtract(pdfBuffer, { mime: 'application/pdf' });
+      const merged = normalizeSpaces((parsedText + '\n' + (t || '')).trim());
+      return merged || parsedText || '';
     } catch (e) {
       console.error('[extractTextFromPdf] Azure OCR falhou:', e.message);
-      return '';
+      return parsedText || '';
     }
   }
 
-  // 3) caso restante: sem OCR ou não parece imagem-only
-  return '';
+  console.log(`[extractTextFromPdf] OCR em blocos: ${totalPages} páginas, bloco=${blockSize}, rpm=${_rate.rpm}`);
+
+  for (let start = 1; start <= totalPages; start += blockSize) {
+    const end = Math.min(start + blockSize - 1, totalPages);
+    const range = start === end ? String(start) : `${start}-${end}`;
+    try {
+      console.log(`[extractTextFromPdf] bloco ${range} → Azure`);
+      const blockText = await azureReadExtract(pdfBuffer, { mime: 'application/pdf', pages: range });
+      console.log(`[extractTextFromPdf] bloco ${range} OK (${(blockText || '').length} chars)`);
+      chunks.push(blockText || '');
+    } catch (e) {
+      console.warn(`[extractTextFromPdf] Bloco ${range} falhou: ${e.message}`);
+      // continua para os próximos blocos
+    }
+  }
+
+  const ocrText = normalizeSpaces(chunks.join('\n'));
+  const merged = normalizeSpaces((parsedText + '\n' + ocrText).trim());
+  return merged || parsedText || '';
 }
 
-/* ========================= (Opcional) imagem ========================= */
-async function extractTextFromImage(_imagePath) {
-  return ''; // mantido vazio; foco é Azure OCR para PDF
+/* ========================= Imagem (via Azure Read) ========================= */
+async function extractTextFromImage(imagePath, originalName = imagePath) {
+  try {
+    if (!OCR_ENABLED) return '';
+    const buf = fs.readFileSync(imagePath);
+    const ext = path.extname(originalName || '').toLowerCase();
+    const mime =
+      ext === '.png'                    ? 'image/png'  :
+      ext === '.jpg' || ext === '.jpeg' ? 'image/jpeg' :
+      ext === '.tif' || ext === '.tiff' ? 'image/tiff' :
+      'application/octet-stream';
+    const text = await azureReadExtract(buf, { mime });
+    return normalizeSpaces(text || '');
+  } catch (e) {
+    console.error('[extractTextFromImage] falhou:', e.message);
+    return '';
+  }
 }
 
-module.exports = { extractTextFromPdf, extractTextFromImage };
+module.exports = {
+  extractTextFromPdf,
+  extractTextFromImage,
+  // helpers opcionais
+  countPdfMarkers,
+  isLikelyImageOnlyPdf
+};

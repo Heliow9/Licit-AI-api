@@ -3,16 +3,15 @@ const fs = require('fs');
 const fsp = require('fs/promises');
 const path = require('path');
 const PDFDocument = require('pdfkit');
-const { getDb } = require('../Config/db');
+const Cats = require('../models/catModel');
 const { MAX_EDITALTEXT_CHARS } = require('../Config/env');
 const { extractTextFromPdf } = require('../utils/ocr');
 
 const {
   extractRequirementsFromBid,
-  analyzeSingleRequirement,
+  analyzeRequirementWithContext,
   generateExecutiveSummary,
   findEvidenceOnTheFly,
-  // === novos helpers vindos do services/evidence ===
   countEliminatoryFailures,
   computeSuccessProbability,
   renderSuccessBanner,
@@ -26,19 +25,17 @@ const {
   suggestBestRT,
   compareReqVsCat,
   signaturesFor,
-  hasDomainOverlap
+  detectDomain,          // detector de domínio
 } = require('../services/cats');
 
 /* ========= multi-tenant helpers ========= */
 const DATA_ROOT = path.resolve(process.cwd(), 'data');
 function getReportsDir(companyId) {
-  // tenant: data/tenants/<companyId>/reports ; fallback: data/reports
   return companyId
     ? path.join(DATA_ROOT, 'tenants', String(companyId), 'reports')
     : path.join(DATA_ROOT, 'reports');
 }
 function getTenantId(req) {
-  // tenta auth.companyId, depois req.companyId (caso seu middleware coloque lá)
   return (req.auth && req.auth.companyId) || req.companyId || null;
 }
 
@@ -51,10 +48,9 @@ function normalizeField(v) {
 }
 function stripLine(s) { return (s || '').replace(/\s+/g, ' ').trim(); }
 
-/* Limpa poluição de OCR no "OBJETO" e limita tamanho */
 function tidyObjeto(s = '', max = 300) {
   const cleaned = String(s)
-    .replace(/^\s*\d+\s*\/\s*\d+\s*$/gm, '')      // "2/23"
+    .replace(/^\s*\d+\s*\/\s*\d+\s*$/gm, '')
     .replace(/AVISO DE LICITA[ÇC][AÃ]O[\s\S]*$/i, '')
     .replace(/https?:\/\/\S+/gi, '')
     .replace(/\s+/g, ' ')
@@ -110,26 +106,51 @@ function parseBidHeader(editalText = '') {
   };
 }
 
-/* ============ PDF helpers (keep-together) ============ */
+/* ================== PDF helpers – layout melhorado ================== */
+
+// ⚠️ Quebra agressiva de qualquer sequência sem espaços
+function softBreakLongWords(text = '', minLen = 40, chunk = 12) {
+  const ZWSP = '\u200B'; // zero-width space
+  return String(text || '').replace(
+    new RegExp(`(\\S{${minLen},})`, 'g'),
+    (m) => {
+      let out = '';
+      for (let i = 0; i < m.length; i += chunk) out += m.slice(i, i + chunk) + ZWSP;
+      return out;
+    }
+  );
+}
+
 function cleanTextForPdf(text = '') {
-  return String(text || '')
+  let s = String(text || '')
     .replace(/<[^>]+>/g, '')
     .replace(/\r\n/g, '\n')
     .replace(/^\s*-{3,}\s*$/gm, '')
-    .replace(/\n{3,}/g, '\n\n')
-    .trim();
+    .replace(/\n{3,}/g, '\n\n');
+
+  // ⚠️ Insere quebra em URLs antes de renderizar
+  s = s.replace(/https?:\/\/\S+/gi, (url) => softBreakLongWords(url, 20, 8));
+
+  // pequenos ajustes de layout
+  s = s.replace(/(Score:\s*\d+%)(?=\S)/g, '$1\n');
+  s = s.replace(/(%\s*Sum[aá]rio)/gi, '%\n$1');
+  s = s.replace(/(%\s*Atendimento)/gi, '%\n$1');
+
+  // ⚠️ Quebra geral de tokens longos (evita loop no LineWrapper do pdfkit)
+  s = softBreakLongWords(s, 40, 12);
+
+  return s;
 }
 
-/** Parser de blocos para keep-together */
 function chunkMarkdownToBlocks(md) {
   const rawLines = cleanTextForPdf(md).split('\n');
   const blocks = [];
   let i = 0;
 
-  const isBlank = (s) => !s || /^\s*$/.test(s);
-  const isHeading = (s) => /^(#{1,3})\s+/.test(s);
-  const headingLevel = (s) => ((s.match(/^(#{1,3})\s+/) || [,''])[1] || '').length;
-  const isBadge = (s) => /^[🟢🟡🔴]/.test(s);
+  const isBlank     = (s) => !s || /^\s*$/.test(s);
+  const isHeading   = (s) => /^(#{1,3})\s+/.test(s);
+  const headingLvl  = (s) => ((s.match(/^(#{1,3})\s+/) || [,''])[1] || '').length;
+  const isBadge     = (s) => /^[🟢🟡🔴]/.test(s);
   const isTopBullet = (s) => /^-\s+/.test(s);
   const isSubBullet = (s) => /^ {2,}-\s+/.test(s);
 
@@ -137,7 +158,7 @@ function chunkMarkdownToBlocks(md) {
     const line = rawLines[i];
 
     if (isBlank(line)) { blocks.push({ type: 'spacer', lines: [''] }); i += 1; continue; }
-    if (isHeading(line)) { blocks.push({ type: 'heading', level: headingLevel(line), lines: [line.replace(/^#{1,3}\s+/, '')] }); i += 1; continue; }
+    if (isHeading(line)) { blocks.push({ type: 'heading', level: headingLvl(line), lines: [line.replace(/^#{1,3}\s+/, '')] }); i += 1; continue; }
     if (isBadge(line)) { blocks.push({ type: 'badge', lines: [line] }); i += 1; continue; }
 
     if (isTopBullet(line)) {
@@ -167,11 +188,23 @@ function chunkMarkdownToBlocks(md) {
   return blocks;
 }
 
+function drawDivider(doc, width) {
+  doc.moveDown(0.35);
+  const y = doc.y;
+  doc.save()
+    .lineWidth(0.8)
+    .strokeColor('#e5e7eb')
+    .moveTo(doc.page.margins.left, y)
+    .lineTo(doc.page.width - doc.page.margins.right, y)
+    .stroke()
+    .restore();
+  doc.moveDown(0.35);
+}
+
 function renderBlocksKeepTogether(doc, md, width) {
   const blocks = chunkMarkdownToBlocks(md);
-  const LINE_GAP = 2;
-  const TOP_INDENT = 8;
-  const SUB_INDENT = 18;
+  const LINE_GAP   = 2.2;
+  const SUB_INDENT = 20;
 
   const spaceLeft = () => doc.page.height - doc.page.margins.bottom - doc.y;
 
@@ -184,12 +217,12 @@ function renderBlocksKeepTogether(doc, md, width) {
         doc.font('Helvetica-Bold').fontSize(size);
         const h = doc.heightOfString(b.lines.join('\n'), { width, lineGap: LINE_GAP });
         doc.font('Helvetica').fontSize(11);
-        return h + 4;
+        return h + 6;
       }
       case 'badge': {
         const text = b.lines.join('\n').replace(/^[^\s]+\s*/, '');
-        const h = doc.heightOfString(text, { width: width - 12, lineGap: LINE_GAP });
-        return h + 10;
+        const h = doc.heightOfString(text, { width: width - 14, lineGap: LINE_GAP });
+        return h + 12;
       }
       case 'listItem': {
         let h = 0;
@@ -214,23 +247,23 @@ function renderBlocksKeepTogether(doc, md, width) {
     doc.fillColor('#000').font('Helvetica').fontSize(11);
     switch (b.type) {
       case 'spacer':
-        doc.moveDown(0.35); return;
+        doc.moveDown(0.3); return;
       case 'heading': {
         const size = b.level === 1 ? 16 : (b.level === 2 ? 13 : 12);
         doc.font('Helvetica-Bold').fontSize(size);
-        doc.text(b.lines.join('\n'), { width, align: 'left', lineGap: 2 });
+        doc.text(b.lines.join('\n'), { width, align: 'left', lineGap: 2.2 });
         doc.font('Helvetica').fontSize(11);
-        if (b.level === 1) doc.moveDown(0.15);
+        if (b.level === 1) drawDivider(doc, width);
         return;
       }
       case 'badge': {
         const raw = b.lines[0] || '';
         const color = raw.startsWith('🟢') ? '#22c55e' : raw.startsWith('🟡') ? '#f59e0b' : '#ef4444';
         const text = raw.replace(/^[^\s]+\s*/, '');
-        const x = doc.x, y = doc.y + 5;
-        doc.save().circle(x + 4, y, 4).fill(color).restore();
+        const x = doc.x, y = doc.y + 6;
+        doc.save().circle(x + 5, y, 4).fill(color).restore();
         doc.fillColor('#000');
-        doc.text(text, x + 12, doc.y, { width: width - 12, align: 'left', lineGap: 2 });
+        doc.text(text, x + 14, doc.y, { width: width - 16, align: 'left', lineGap: 2.2 });
         doc.fillColor('#000');
         return;
       }
@@ -238,24 +271,26 @@ function renderBlocksKeepTogether(doc, md, width) {
         for (const ln of b.lines) {
           if (/^-\s+/.test(ln)) {
             const t = '• ' + ln.replace(/^-\s+/, '');
-            doc.text(t, { width, align: 'left', lineGap: 2, indent: TOP_INDENT });
+            doc.text(t, { width, align: 'left', lineGap: 2.2, indent: 10 });
           } else {
             const t = '• ' + ln.replace(/^ {2,}-\s+/, '');
             const x = doc.x + SUB_INDENT;
             const y = doc.y;
-            doc.text(t, x, y, { width: width - SUB_INDENT, align: 'left', lineGap: 2 });
+            doc.text(t, x, y, { width: width - SUB_INDENT, align: 'left', lineGap: 2.2 });
           }
         }
+        doc.moveDown(0.1);
         return;
       }
       case 'paragraph': {
         const line = b.lines.join('\n');
+        // negrito **...** seguro
         const parts = line.split(/\*\*(.+?)\*\*/g);
         for (let i = 0; i < parts.length; i++) {
           const chunk = parts[i];
           if (!chunk) continue;
           doc.font(i % 2 ? 'Helvetica-Bold' : 'Helvetica');
-          doc.text(chunk, { width, continued: i < parts.length - 1, lineGap: 2 });
+          doc.text(chunk, { width, continued: i < parts.length - 1, lineGap: 2.2, align: 'justify' });
         }
         doc.text('');
         return;
@@ -279,28 +314,78 @@ function renderMdWithLogicalBreak(doc, md, width) {
   renderBlocksKeepTogether(doc, '## Análise Detalhada' + b, width);
 }
 
-/* ========= gerarPdf multi-tenant ========= */
+// Rodapé/cabeçalho
+function attachHeaderFooter(doc, title = 'RELATÓRIO DE VIABILIDADE') {
+  const drawHF = () => {
+    const { page, page: { width, margins } } = doc;
+
+    const headerFontSize = 10;
+    const footerFontSize = 9;
+
+    const yTop = Math.max(12, margins.top - 28);
+    const yBot = page.height - margins.bottom - footerFontSize - 6;
+
+    // Header
+    doc.save()
+      .font('Helvetica-Bold').fontSize(headerFontSize).fillColor('#111827')
+      .text(title, margins.left, yTop, {
+        width: width - margins.left - margins.right,
+        align: 'center',
+        lineBreak: false,
+      })
+      .restore();
+
+    // Footer
+    const pageNum = doc.page.number;
+    doc.save()
+      .font('Helvetica').fontSize(footerFontSize).fillColor('#6b7280')
+      .text(`Página ${pageNum}`, margins.left, yBot, {
+        width: width - margins.left - margins.right,
+        align: 'center',
+        lineBreak: false,
+      })
+      .restore();
+  };
+
+  // Primeira página
+  drawHF();
+
+  // Páginas subsequentes
+  doc.on('pageAdded', () => {
+    drawHF();
+  });
+}
+
+/* ========= gerarPdf multi-tenant (layout novo) ========= */
 async function gerarPdf(markdown, companyId = null) {
   const REPORTS_DIR = getReportsDir(companyId);
   await fsp.mkdir(REPORTS_DIR, { recursive: true });
   const filename = `relatorio_viabilidade_${Date.now()}.pdf`;
   const outPath = path.join(REPORTS_DIR, filename);
 
-  const doc = new PDFDocument({ size: 'A4', margin: 50 });
+  // limite defensivo para não explodir o PDF
+  const MAX_CHARS_REPORT = 250_000;
+  if (markdown && markdown.length > MAX_CHARS_REPORT) {
+    markdown = markdown.slice(0, MAX_CHARS_REPORT) + '\n\n… [trecho truncado para emissão do PDF]';
+  }
+
+  const doc = new PDFDocument({ size: 'A4', margin: 54 });
   const stream = fs.createWriteStream(outPath);
   doc.pipe(stream);
 
   const contentWidth = doc.page.width - doc.page.margins.left - doc.page.margins.right;
 
-  doc.on('pageAdded', () => {
-    doc.font('Helvetica').fontSize(11).fillColor('#000');
-  });
+  attachHeaderFooter(doc, 'RELATÓRIO DE VIABILIDADE');
 
-  doc.font('Helvetica-Bold').fontSize(16)
-     .text('RELATÓRIO DE VIABILIDADE', { align: 'center', width: contentWidth, lineGap: 2 });
-  doc.moveDown(0.4);
+  doc.moveDown(1.2);
+  doc.font('Helvetica-Bold').fontSize(18).fillColor('#111827')
+     .text('RELATÓRIO DE VIABILIDADE', { align: 'center', width: contentWidth });
+  doc.moveDown(0.35);
+  doc.font('Helvetica').fontSize(10).fillColor('#6b7280')
+     .text(`Emitido em: ${new Date().toLocaleString('pt-BR')}`, { align: 'center', width: contentWidth })
+     .fillColor('#000');
+  doc.moveDown(0.7);
 
-  doc.font('Helvetica').fontSize(11).fillColor('#000');
   renderMdWithLogicalBreak(doc, markdown || '-', contentWidth);
 
   doc.end();
@@ -317,9 +402,9 @@ async function gerarPdf(markdown, companyId = null) {
   };
 }
 
-/* ============ PROGRESS LOGGER ============ */
+/* ============ PROGRESS LOGGER (sempre ligado) ============ */
 function makeProgressLogger() {
-  const WEIGHTS = { OCR: 15, HEADER: 5, FILES_TEXT: 10, CAT_SEARCH: 40, REQUIREMENTS: 20, SUMMARY: 5, PDF: 5 };
+  const WEIGHTS = { OCR: 20, HEADER: 5, FILES_TEXT: 0, CAT_SEARCH: 45, REQUIREMENTS: 20, SUMMARY: 5, PDF: 5 };
   let pct = 0;
   const log = (msg) => console.log(`[analisarEdital] ${msg}`);
   const bump = (delta, msg) => { pct = Math.min(100, pct + delta); log(`[${pct.toFixed(1)}%] ${msg}`); };
@@ -337,16 +422,9 @@ function makeProgressLogger() {
 }
 
 /* ======= indicador ponderado (70/30) ======= */
-function parseStatusFromText(block = '') {
-  const t = (block || '').toLowerCase();
-  if (/não atendido|nao atendido|🔴/i.test(t)) return 'NAO';
-  if (/atendido parcialmente|🟡/i.test(t)) return 'PARCIAL';
-  if (/atendido|🟢/i.test(t)) return 'OK';
-  return 'PARCIAL';
-}
 function computeWeightedIndicators(items) {
   const tech = items.filter(i => i.kind === 'TECH');
-  const doc  = items.filter(i => i.kind === 'DOC'); // documental/administrativo
+  const doc  = items.filter(i => i.kind === 'DOC');
   const count = (arr, st) => arr.filter(i => i.status === st).length;
 
   const okT = count(tech, 'OK'), paT = count(tech, 'PARCIAL'), naT = count(tech, 'NAO');
@@ -356,7 +434,6 @@ function computeWeightedIndicators(items) {
   const techScore = score(okT, paT, tech.length);
   const docScore  = score(okD, paD, doc.length);
 
-  // >>> AJUSTE: 70% técnica / 30% documental
   const finalPct = Math.round((0.7 * techScore + 0.3 * docScore) * 100);
 
   return {
@@ -373,118 +450,111 @@ function recomendacaoByPct(pct) {
   return { label: '🔴 PARTICIPAÇÃO NÃO RECOMENDADA', cor: 'vermelho' };
 }
 
-// Regex técnica local ao controller (para identificar requisitos técnicos rapidamente)
-const TECH_REQ_RX =
-  /\b(cat(?:s)?|capacidade\s+t[eé]cnica|capacit[aã]o\s+t[eé]cnica|atestado(?:s)?\s+de?\s+capacidade|acervo\s+t[eé]cnico|experi[êe]ncia(?:\s+t[eé]cnica)?|respons[aá]vel\s+t[eé]cnico|(?:\b|^)RT\b)\b/i;
-
 /* ============ CONTROLLER principal (multi-empresa) ============ */
 async function analisarEdital(req, res) {
+  console.log("[controller] HIT /api/edital/analisar | editalController v3.4 MONGO-FIRST");
   const PROGRESS = makeProgressLogger();
   const tenantId = getTenantId(req);
 
+  console.log("[controller] headers content-type =", req.headers['content-type'] || '(sem)');
+
   if (!req.files || !req.files.editalPdf || req.files.editalPdf.length !== 1) {
+    console.log("[controller] arquivo inválido: esperava exatamente 1 em 'editalPdf'");
     return res.status(400).json({ error: 'Envie exatamente 1 arquivo PDF do edital (campo: editalPdf).' });
   }
 
   const mainEditalFile = req.files.editalPdf[0];
   const annexFiles = req.files['arquivos[]'] || [];
+  console.log("[controller] files.editalPdf =", (req.files?.editalPdf||[]).length, "| files['arquivos[]'] =", annexFiles.length);
+
   console.log(`\n-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=`);
-  console.log(`[${new Date().toLocaleString('pt-BR')}] Nova análise: ${mainEditalFile.originalname} (+${annexFiles.length} anexos) | tenant=${tenantId || 'public'}`);
-
-  // Mongo opcional
-  let catsCol = null, chunksCol = null;
-  try {
-    const db = await getDb();
-    chunksCol = db.collection('chunks');
-    catsCol   = db.collection('cats');
-    console.log(`[Mongo] OK: "chunks" e "cats" prontos para consulta.`);
-  } catch (e) {
-    console.error('[Mongo] ERRO ao conectar. Segue análise apenas com arquivos locais:', e.message);
-  }
+  console.log(`[${new Date().toLocaleString('pt-BR')}] Nova análise: ${mainEditalFile.originalname} (+${annexFiles.length} anexos enviados, ignorados para evidência local) | tenant=${tenantId || 'public'}`);
 
   try {
-    // OCR
+    // OCR somente do EDITAL (para extrair cabeçalho/objeto/requisitos)
     const rawPdf = fs.readFileSync(mainEditalFile.path);
     const mainEditalText = await extractTextFromPdf(rawPdf, mainEditalFile.path);
     if (!mainEditalText?.trim()) {
+      console.log("[controller] OCR vazio para o PDF principal");
       return res.status(400).json({ error: 'Não foi possível extrair texto do PDF principal.' });
     }
     const editalText = mainEditalText.slice(0, MAX_EDITALTEXT_CHARS || 200000);
     PROGRESS.phase('OCR', `Texto do edital extraído (${editalText.length.toLocaleString('pt-BR')} chars)`);
 
-    // Header
+    // Cabeçalho/assinaturas
     const header = parseBidHeader(editalText);
-    const objSigs = signaturesFor(header.objetoLicitado || editalText);
-    PROGRESS.phase('HEADER', `Cabeçalho extraído | Sigs(objeto): [${objSigs.join(', ')}]`);
+    const objSigs = signaturesFor(tenantId, header.objetoLicitado || editalText);
+    console.log("[controller] OBJETO(limpo)=", header.objetoLicitado || '(n/a)');
+    PROGRESS.phase('HEADER', `Cabeçalho extraído | Sigs(objeto): [${objSigs.short}]`);
 
-    // Arquivos para evidências
-    const filesForEvidenceSearch = await Promise.all(
-      [mainEditalFile, ...annexFiles].map(async (file) => ({
-        source: file.originalname,
-        getText: async () => extractTextFromPdf(fs.readFileSync(file.path), file.path)
-      }))
-    );
+    // Domínios do edital (documento inteiro)
+    const editalDomains = detectDomain(editalText);
+    const editalDomainsArr = [...editalDomains];
+    const isEngineeringDomain = editalDomainsArr.some(d => ['engenharia_civil','eletrica','hidraulica','manutencao_predial'].includes(d));
+    const isHealthOnly = !isEngineeringDomain && editalDomainsArr.some(d => ['odontologia','saude'].includes(d));
+    console.log('[controller] domains.edital =', editalDomainsArr, '| isEngineeringDomain =', isEngineeringDomain, '| isHealthOnly =', isHealthOnly);
 
-    // Texto local
-    const subFilesTick = PROGRESS.sub('FILES_TEXT', filesForEvidenceSearch.length);
-    const localFilesText = [];
-    for (let i = 0; i < filesForEvidenceSearch.length; i++) {
-      const f = filesForEvidenceSearch[i];
-      try {
-        const txt = await f.getText();
-        localFilesText.push({ source: f.source, text: txt || '' });
-        subFilesTick(i + 1, `OCR local: ${f.source}`);
-      } catch (e) {
-        console.warn(`[OCR local] Falha ao extrair "${f.source}":`, e.message);
-        subFilesTick(i + 1, `OCR local: ${f.source} (falhou)`);
-      }
+    // >>>> Estratégia MONGO-FIRST:
+    // - Não vamos fazer OCR dos anexos locais.
+    // - Evidências e CATs serão buscadas nas coleções do MySQL.
+    // - Mantemos apenas "placeholders" vazios para interfaces antigas das funcs.
+    const filesForEvidenceSearch = []; // vazio = sem leitura local
+    const localFilesText = [];         // vazio = sem OCR local
+    PROGRESS.phase('FILES_TEXT', 'Evidências serão consultadas diretamente no MySQL (sem OCR de anexos).');
+
+    // Busca de CATs (apenas para engenharia) — usando APENAS o MySQL
+    let topCats = [];
+    let domainAligned = false;
+
+    if (isEngineeringDomain) {
+      let totalCandidatesEstimate = 1;
+      const catSearchTick = PROGRESS.sub('CAT_SEARCH', () => totalCandidatesEstimate);
+
+      const domainProbe = [header.objetoLicitado, editalText].filter(Boolean).join('\n');
+
+      const allCatsRaw = await findCATMatches(
+        Cats,
+        domainProbe,
+        12,
+        [], // <<< sem base local
+        {
+          tenantId,
+          debug: (evt) => {
+            try {
+              if (evt.kind === 'mysqlBatchCats')  { totalCandidatesEstimate += Math.max(0, evt.total); }
+              if (evt.kind === 'mysqlItemCats')   { catSearchTick(Math.min(evt.i, totalCandidatesEstimate), `MySQL CATS ${evt.source}`); }
+              if (evt.kind === 'mysqlBatchChunks'){ totalCandidatesEstimate += Math.max(0, evt.total); }
+              if (evt.kind === 'mysqlItemChunks'){ catSearchTick(Math.min(evt.i, totalCandidatesEstimate), `MySQL CHUNKS ${evt.source}`); }
+              // intencionalmente ignoramos eventos "localBatch"/"localItem"
+            } catch {}
+          }
+        }
+      );
+
+      // Dedup e score somente para **aprovadas** (score>0)
+      const dedupCats = uniqueByCat(allCatsRaw).map(c => ({ ...c, ano: pickReasonableYear(c.raw) || c.ano || '' }));
+
+      const ranked = dedupCats
+        .map(c => ({ meta: c, score: scoreCatToObjetoLote(c, domainProbe) })) // score=0 se domínio não bater
+        .filter(r => (r.score || 0) > 0)         // SOMENTE aprovadas
+        .sort((a,b)=>b.score-a.score)
+        .slice(0, 3);
+
+      topCats = ranked.map(r => r.meta);
+      domainAligned = ranked.length > 0;
+
+      console.log("[controller] CATs top =", topCats.length, "| domainAligned =", domainAligned);
+    } else {
+      PROGRESS.phase('CAT_SEARCH', 'Domínio não-engenharia — CATs desabilitadas');
     }
 
-    // CATs combinadas (multi-tenant filter via opts.tenantId)
-    let totalCandidatesEstimate = 1;
-    const catSearchTick = PROGRESS.sub('CAT_SEARCH', () => totalCandidatesEstimate);
-    const allCatsRaw = await findCATMatches(
-      (catsCol || chunksCol) ? { catsCol, chunksCol } : null,
-      header.objetoLicitado || editalText,
-      8,
-      localFilesText,
-      {
-        tenantId,  // <<<<<<<<<<<<<<<<<<<<< multi-empresa
-        debug: (evt) => {
-          try {
-            if (evt.kind === 'mongoBatchCats') { totalCandidatesEstimate += Math.max(0, evt.total); }
-            if (evt.kind === 'mongoItemCats')   { catSearchTick(Math.min(evt.i, totalCandidatesEstimate), `Analisando (CATS) ${evt.source}`); }
-            if (evt.kind === 'mongoBatchChunks'){ totalCandidatesEstimate += Math.max(0, evt.total); }
-            if (evt.kind === 'mongoItemChunks'){ catSearchTick(Math.min(evt.i, totalCandidatesEstimate), `Analisando (CHUNKS) ${evt.source}`); }
-            if (evt.kind === 'localBatch')      { totalCandidatesEstimate += evt.total; }
-            if (evt.kind === 'localItem')       { catSearchTick(Math.min(evt.i + (evt.offset || 0), totalCandidatesEstimate), `Analisando (Local) ${evt.source}`); }
-          } catch {}
-        }
-      }
-    );
-
-    const dedupCats = uniqueByCat(allCatsRaw).map(c => ({ ...c, ano: pickReasonableYear(c.raw) || c.ano || '' }));
-    const loteTexto = (header.concorrenciaEletronica || '') + '\n' + (header.tipo || '');
-    const ranked = dedupCats.map(c => ({ meta: c, score: scoreCatToObjetoLote(c, header.objetoLicitado || editalText, loteTexto) }))
-                            .sort((a,b)=>b.score-a.score);
-
-    const objHasDomain = signaturesFor(header.objetoLicitado || editalText).length > 0;
-    const MIN_ALIGN_SCORE = objHasDomain ? 5 : 3;
-
-    const rankedCatsDomain = ranked.map(r => r.meta)
-      .filter(c => objHasDomain ? hasDomainOverlap(header.objetoLicitado || editalText, c.raw || '', c.fileName || '') : true);
-
-    const rescored = rankedCatsDomain.map(c => ({ meta: c, score: scoreCatToObjetoLote(c, header.objetoLicitado || editalText, loteTexto) }))
-                                     .sort((a,b)=>b.score-a.score);
-
-    const filtered = rescored.filter(r => r.score >= MIN_ALIGN_SCORE);
-    const topCats = filtered.slice(0, 2).map(r => r.meta);
-    const domainAligned = filtered.length > 0;
-
-    // Requisitos
+    // Requisitos extraídos do edital (OCR do edital apenas)
     const allRequirements = await extractRequirementsFromBid(editalText);
     const requirementsToAnalyze = (allRequirements || [])
       .filter(r => !/credenciamento|chave|senha|licitanet|comprasnet|bll|enviar proposta/i.test((r || '')));
+
+    console.log("[controller] extractRequirementsFromBid ->", Array.isArray(allRequirements) ? allRequirements.length : "N/A");
+    console.log("[controller] requirementsToAnalyze ->", requirementsToAnalyze.length);
 
     const analysesMd = [];
     const results = [];
@@ -494,44 +564,75 @@ async function analisarEdital(req, res) {
       const reqTxt = requirementsToAnalyze[i];
       if (!reqTxt) { reqTick(i + 1, 'requisito vazio'); continue; }
 
-      const isTech = TECH_REQ_RX.test(reqTxt);
+      const isTechKeyword = /\b(cat|acervo|atestado|respons[áa]vel\s+t[ée]cnico|rt)\b/i.test(reqTxt);
+      console.log('[controller] loop req %d/%d | isEngineeringDomain=%s | topCats=%d | isTechKeyword=%s | req="%s"',
+        i + 1, requirementsToAnalyze.length, isEngineeringDomain, topCats.length, isTechKeyword, (reqTxt||'').slice(0, 120));
 
-      if (isTech && topCats.length > 0) {
-        const bullets = topCats.map(c => {
-          const tags = [
-            c.catNum ? `CAT nº ${c.catNum}` : (c.fileHints?.fileCatNum ? `CAT nº ${c.fileHints.fileCatNum}` : null),
-            c.hasART ? 'ART' : null,
-            c.hasCREA ? 'CREA/CAU' : null
-          ].filter(Boolean).join(' · ');
-          const label = `${c.nomeCAT || c.fileName || c.source}${c.ano ? ` (${c.ano})` : (c.fileHints?.fileYear ? ` (${c.fileHints.fileYear})` : '')}`;
-          return `- ${label} — ${tags || '—'}`;
-        }).join('\n');
+      // ---------- CAT + EVIDENCE (engenharia) — **MySQL-first**
+      if (isEngineeringDomain && isTechKeyword) {
+        if (topCats.length > 0 && domainAligned) {
+          const bullets = topCats.map((c, idx) => {
+            const tags = [
+              c.catNum ? `CAT nº ${c.catNum}` : (c.fileHints?.fileCatNum ? `CAT nº ${c.fileHints.fileCatNum}` : null),
+              c.hasART ? 'ART' : null,
+              c.hasCREA ? 'CREA/CAU' : null
+            ].filter(Boolean).join(' · ');
+            const year = c.ano || c.fileHints?.fileYear || '';
+            const label = `${c.nomeCAT || c.fileName || c.source}${year ? ` (${year})` : ''}`;
+            const place = ['1º','2º','3º'][idx] || `${idx+1}º`;
+            return `- **${place}** — ${label} — ${tags || '—'}`;
+          }).join('\n');
 
-        const statusTxt = domainAligned ? '🟢 ATENDIDO.' : '🟡 ATENDIDO PARCIALMENTE.';
-        const note = domainAligned ? '' : '\n\n> Observação: CATs localizadas com aderência parcial; ideal substituir por CATs do mesmo escopo do edital.';
-        const block = `Requisito: ${reqTxt}\n\n${statusTxt}\n\nA qualificação técnica é suportada por:\n${bullets}${note}`;
+          let block = `Requisito: ${reqTxt}\n\n🟢 ATENDIDO.\n\nQualificação técnica suportada por:\n${bullets}`;
 
-        analysesMd.push(block);
-        results.push({ kind: 'TECH', status: domainAligned ? 'OK' : 'PARCIAL', req: reqTxt });
-        reqTick(i + 1, 'análise com CATs do topo');
-        continue;
+          try {
+            // Sem leitura local; busca evidências APENAS no MySQL
+            const evidence = await findEvidenceOnTheFly(reqTxt, [], Cats, { tenantId });
+            const docBlock = await analyzeRequirementWithContext(reqTxt, evidence, (req.auth && req.auth.companyProfile) || {}, { isEngineering: true });
+            block += `\n\n---\n**Corroboração por evidências (base MySQL)**\n\n${docBlock}`;
+          } catch (e) {
+            block += `\n\n> (Falha ao buscar evidências MySQL: ${e.message})`;
+          }
+
+          analysesMd.push(block);
+          results.push({ kind: 'TECH', status: 'OK', req: reqTxt });
+          reqTick(i + 1, 'CAT + evidências (MySQL)');
+          continue;
+        } else {
+          const block = `Requisito: ${reqTxt}\n\n🔴 **NÃO ATENDIDO** — Sem acervo (CAT) aderente no MySQL.`;
+          analysesMd.push(block);
+          results.push({ kind: 'TECH', status: 'NAO', req: reqTxt });
+          reqTick(i + 1, 'sem acervo (MySQL)');
+          continue;
+        }
       }
 
-      const evidence = await findEvidenceOnTheFly(reqTxt, filesForEvidenceSearch, chunksCol);
-      const block = await analyzeSingleRequirement(reqTxt, evidence);
+      // ---------- EVIDENCE documental — **MySQL-first**
+      const evidence = await findEvidenceOnTheFly(reqTxt, [], Cats, { tenantId });
+      const block = await analyzeRequirementWithContext(reqTxt, evidence, (req.auth && req.auth.companyProfile) || {}, { isEngineering: false });
       analysesMd.push(block);
-      results.push({ kind: 'DOC', status: parseStatusFromText(block), req: reqTxt });
-      reqTick(i + 1, 'análise por evidências');
+      results.push({
+        kind: 'DOC',
+        status: (() => {
+          const t = block.toLowerCase();
+          if (/n[aã]o atendido/.test(t) || /🔴/.test(block)) return 'NAO';
+          if (/atendido parcialmente/.test(t) || /🟡/.test(block)) return 'PARCIAL';
+          if (/atendido/.test(t) || /🟢/.test(block)) return 'OK';
+          return 'PARCIAL';
+        })(),
+        req: reqTxt
+      });
+      reqTick(i + 1, 'evidências (MySQL)');
     }
 
     // Indicadores ponderados (70/30)
     const indic = computeWeightedIndicators(results);
     const rec = recomendacaoByPct(indic.pct);
 
-    // Probabilidade de êxito (usa scores 0..1 e penaliza eliminatório não atendido)
-    const eliminatoriosNaoAt = countEliminatoryFailures(analysesMd); // analisa blocos textuais
-    const probExito = computeSuccessProbability(indic.tech.score, indic.doc.score, eliminatoriosNaoAt);
-    const probBanner = renderSuccessBanner(probExito, eliminatoriosNaoAt);
+    // Probabilidade de êxito
+    const eliminatoriosNaoAt = countEliminatoryFailures ? countEliminatoryFailures(analysesMd) : 0;
+    const probExito = computeSuccessProbability ? computeSuccessProbability(indic.tech.score, indic.doc.score, eliminatoriosNaoAt) : (indic.pct / 100);
+    const probBanner = renderSuccessBanner ? renderSuccessBanner(probExito, eliminatoriosNaoAt) : '';
 
     const indicadoresMd = [
       `### Resultado ponderado`,
@@ -541,43 +642,58 @@ async function analisarEdital(req, res) {
       `**Documental (30%):** ${indic.doc.ok} OK • ${indic.doc.parcial} PARCIAL • ${indic.doc.nao} NÃO — ${indic.doc.pct}%`,
     ].join('\n\n');
 
-    // Bloco Viabilidade (CATs)
-    const blocoViabilidade = (topCats.length
-      ? `### Viabilidade profissional e técnica\n\nCom base no acervo (CATs), identificamos ${domainAligned ? '**aderência técnica direta**' : '**aderência parcial**'} ao objeto licitado:\n\n${
-          topCats.map(c => {
-            const comp = [
-              c.catNum ? `CAT nº ${c.catNum}` : (c.fileHints?.fileCatNum ? `CAT nº ${c.fileHints.fileCatNum}` : null),
-              c.hasART ? 'ART' : null,
-              c.hasCREA ? 'CREA/CAU' : null
-            ].filter(Boolean).join(' · ');
-            const head = [
-              `**CAT:** ${c.nomeCAT || c.fileName || c.source}`,
-              c.orgao ? `**Órgão/Entidade:** ${c.orgao}` : (c.fileHints?.fileOrgao ? `**Órgão/Entidade:** ${c.fileHints.fileOrgao}` : null),
-              c.ano ? `**Ano:** ${c.ano}` : (c.fileHints?.fileYear ? `**Ano:** ${c.fileHints.fileYear}` : null)
-            ].filter(Boolean).join(' | ');
-            return `- ${head}\n  - **Escopo/Resumo:** ${c.escopo || '-'}\n  - **Comprovações:** ${comp || '—'}`;
-          }).join('\n\n')
-        }`
-      : '### Viabilidade profissional e técnica\n\n- **Não localizamos CATs aderentes automaticamente.** Recomenda-se checagem manual do acervo.'
+    // Bloco Viabilidade (CATs) — somente para engenharia
+    const blocoViabilidade = (isEngineeringDomain
+      ? (topCats.length
+          ? `### Viabilidade profissional e técnica\n\nCom base no acervo (CATs) **encontrado no MySQL**, identificamos **aderência técnica** ao objeto licitado:\n\n${
+              topCats.map((c, idx) => {
+                const comp = [
+                  c.catNum ? `CAT nº ${c.catNum}` : (c.fileHints?.fileCatNum ? `CAT nº ${c.fileHints.fileCatNum}` : null),
+                  c.hasART ? 'ART' : null,
+                  c.hasCREA ? 'CREA/CAU' : null
+                ].filter(Boolean).join(' · ');
+                const head = [
+                  `**CAT:** ${c.nomeCAT || c.fileName || c.source}`,
+                  c.orgao ? `**Órgão/Entidade:** ${c.orgao}` : (c.fileHints?.fileOrgao ? `**Órgão/Entidade:** ${c.fileHints.fileOrgao}` : null),
+                  (c.ano || c.fileHints?.fileYear) ? `**Ano:** ${c.ano || c.fileHints?.fileYear}` : null
+                ].filter(Boolean).join(' | ');
+                const place = ['1º','2º','3º'][idx] || `${idx+1}º`;
+                return `- **${place}** — ${head}\n  - **Escopo/Resumo:** ${c.escopo || '-'}\n  - **Comprovações:** ${comp || '—'}`;
+              }).join('\n\n')
+            }`
+          : `### Viabilidade profissional e técnica\n\n- **Sem acervo aderente (CAT) no MySQL** para este edital.`)
+      : '### Viabilidade profissional e técnica\n\n- Para este objeto, a comprovação é por **atestado de capacidade técnica** pertinente (e, quando aplicável, **registro ANVISA/MAPA**), não por CAT/CREA.'
     );
 
-    // RT sugerido
-    const rtSugerido = suggestBestRT(topCats, header.objetoLicitado || editalText);
+    // RT sugerido — só faz sentido em engenharia e com CAT consistente
     let blocoRT = '';
-    if (rtSugerido) {
-      const reqBase = [header.objetoLicitado || '', ...(Array.isArray(allRequirements) ? allRequirements : [])].join('\n');
-      const chosenCat = topCats.find(c => (c.nomeCAT || c.fileName) === rtSugerido.arquivo) || topCats[0];
-      const comp = compareReqVsCat(reqBase, chosenCat?.raw || '');
-      blocoRT = [
-        '### Responsável Técnico Sugerido',
-        `**Nome:** ${rtSugerido.profissional}`,
-        `**CAT nº / Ano / Órgão:** ${rtSugerido.catNum} / ${rtSugerido.ano} / ${rtSugerido.orgao}`,
-        `**Escopo (resumo):** ${rtSugerido.escopo}`,
-        `**Fonte (arquivo):** ${rtSugerido.arquivo}`,
-        '',
-        '#### Comprovação de equivalência/excedente frente ao edital',
-        (comp.length ? comp.map(l => `- ${l}`).join('\n') : '- (Sem parâmetros comparáveis explícitos)')
-      ].join('\n\n');
+    if (isEngineeringDomain && topCats.length) {
+      const rt = suggestBestRT(topCats, header.objetoLicitado || editalText);
+      const chosenCat = topCats[0];
+      if (rt && (rt.profissional || chosenCat?.nomeCAT)) {
+        const reqBase = [header.objetoLicitado || '', ...(Array.isArray(allRequirements) ? allRequirements : [])].join('\n');
+        const comp = compareReqVsCat(reqBase, chosenCat?.raw || '');
+        blocoRT = [
+          '### Responsável Técnico Sugerido',
+          `**Nome:** ${rt.profissional || '—'}`,
+          `**CAT nº / Ano / Órgão:** ${chosenCat?.catNum || chosenCat?.fileHints?.fileCatNum || '—'} / ${(chosenCat?.ano || chosenCat?.fileHints?.fileYear || '—')} / ${(chosenCat?.orgao || chosenCat?.fileHints?.fileOrgao || '—')}`,
+          `**Escopo (resumo):** ${chosenCat?.escopo || '—'}`,
+          `**Fonte (arquivo):** ${chosenCat?.nomeCAT || chosenCat?.fileName || '—'}`,
+          '',
+          '#### Comprovação de equivalência/excedente frente ao edital',
+          (Array.isArray(comp) && comp.length ? comp.map(l => `- ${l}`).join('\n') : '- (Sem parâmetros comparáveis explícitos)')
+        ].join('\n\n');
+      }
+    }
+
+    // Aderência por Lote — opcional (mantém neutro)
+    let blocoLotes = '';
+    if (isEngineeringDomain) {
+      const lotes = (editalText.match(/^\s*Lote\s*\d+\s*[-–:]\s*[^\n]+/gim) || []).slice(0, 8);
+      if (lotes.length) {
+        const lotesAnalise = lotes.map(l => `#### ${l.replace(/^\s*/,'')}\n- (análise de CAT por lote pode ser habilitada aqui; fonte MySQL)`);
+        blocoLotes = ['## Aderência por Lote', ...lotesAnalise].join('\n\n');
+      }
     }
 
     // Sumário executivo
@@ -609,12 +725,11 @@ async function analisarEdital(req, res) {
       `- **Prazo máximo para proposta:** ${header.prazoMaximoParaProposta || '-'}`,
     ].join('\n');
 
-    // >>> Banner de probabilidade no topo do relatório
-    const bannerTopo = probBanner; // já vem formatado em markdown
+    const bannerTopo = probBanner || '';
 
     const finalReport = [
       '# RELATÓRIO DE VIABILIDADE',
-      bannerTopo,                              // <<<<<<<<<<<<<<<< AQUI (topo)
+      bannerTopo,
       '## Dados do edital',
       headerList,
       '',
@@ -623,12 +738,14 @@ async function analisarEdital(req, res) {
       blocoViabilidade,
       blocoRT ? `\n${blocoRT}` : '',
       '',
+      isEngineeringDomain && blocoLotes ? blocoLotes : '',
+      '',
       '## Sumário Executivo',
       summaryPatched,
       '',
       '## Análise Detalhada',
       analysesMd.join('\n\n') || '- (Não foi possível gerar a análise detalhada)'
-    ].join('\n\n');
+    ].filter(Boolean).join('\n\n');
 
     const { publicUrl, filePath, filename } = await gerarPdf(finalReport, tenantId);
     PROGRESS.phase('PDF', `PDF emitido em ${filePath}`);
@@ -636,7 +753,7 @@ async function analisarEdital(req, res) {
     return res.json({
       report: finalReport,
       pdf: { filename, url: publicUrl, path: filePath },
-      probability: { value: Math.round(probExito * 100), eliminatoriosNaoAt }
+      probability: { value: Math.round((probExito || 0) * 100), eliminatoriosNaoAt }
     });
 
   } catch (error) {
@@ -645,7 +762,7 @@ async function analisarEdital(req, res) {
   } finally {
     const allUploadedFiles = [
       ...(req.files?.editalPdf || []),
-      ...((req.files && req.files['arquivos[]']) || [])
+      ...((req.files && req.files['arquivos[]']) || []),
     ];
     for (const f of allUploadedFiles) { try { if (f?.path && fs.existsSync(f.path)) fs.unlinkSync(f.path); } catch {} }
     console.log(`-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=\n`);
@@ -655,6 +772,7 @@ async function analisarEdital(req, res) {
 /** POST /api/edital/gerar-pdf */
 async function gerarPdfFromBody(req, res) {
   try {
+    console.log("[controller] HIT /api/edital/gerar-pdf (from body)");
     const { reportMd } = req.body || {};
     if (!reportMd || typeof reportMd !== 'string' || reportMd.trim().length < 5) {
       return res.status(400).json({ error: 'Campo "reportMd" é obrigatório (string com conteúdo).' });
@@ -671,6 +789,7 @@ async function gerarPdfFromBody(req, res) {
 /** GET /api/edital/analisar/history (scoped ao tenant) */
 async function listarHistorico(req, res) {
   try {
+    console.log("[controller] HIT /api/edital/analisar/history | editalController v3.4 MONGO-FIRST");
     const tenantId = getTenantId(req);
     const REPORTS_DIR = getReportsDir(tenantId);
 
@@ -710,6 +829,7 @@ async function listarHistorico(req, res) {
 /** GET /api/edital/report/:name (scoped ao tenant) */
 async function serveReportByName(req, res) {
   try {
+    console.log("[controller] HIT /api/edital/report/:name", req.params?.name || '');
     const tenantId = getTenantId(req);
     const REPORTS_DIR = getReportsDir(tenantId);
 
@@ -729,11 +849,28 @@ async function serveReportByName(req, res) {
   }
 }
 
+/* ====== Stubs para status/SSE (se um dia ativar async para edital) ====== */
+async function editalStatus(req, res) {
+  return res.status(400).json({ error: 'Async de editais está desabilitado. Use POST /api/edital/analisar (sync).' });
+}
+function editalEvents(req, res) {
+  res.status(200);
+  res.set({
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    Connection: 'keep-alive',
+  });
+  res.write(`event: error\ndata: ${JSON.stringify({ message: 'Async de editais desabilitado' })}\n\n`);
+  try { res.end(); } catch {}
+}
+
 module.exports = {
   analisarEdital,
   gerarPdf,
   gerarPdfFromBody,
   listarHistorico,
   serveReportByName,
-  __getParseHeader: parseBidHeader, // <= para o Core reaproveitar quando quiser
+  editalStatus,   // stubs p/ rotas /status e /events
+  editalEvents,
+  __getParseHeader: parseBidHeader,
 };

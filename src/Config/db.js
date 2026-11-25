@@ -1,21 +1,54 @@
-const { MongoClient } = require('mongodb');
-const { MONGO_URI } = require('./env');
+const mysql = require('mysql2/promise');
+require('./env');
 
-if (!MONGO_URI) {
-  console.warn('⚠️  MONGO_URI não definido no .env');
+let pool;
+
+function getPool() {
+  if (!pool) {
+    const { MYSQL_HOST, MYSQL_PORT, MYSQL_USER, MYSQL_PASSWORD, MYSQL_DATABASE } = process.env;
+    if (!MYSQL_USER || !MYSQL_PASSWORD || !MYSQL_DATABASE) {
+      throw new Error('Configure MYSQL_USER, MYSQL_PASSWORD e MYSQL_DATABASE.');
+    }
+    const port = Number(MYSQL_PORT || 3306);
+    if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('MYSQL_PORT inválida.');
+    pool = mysql.createPool({
+      host: MYSQL_HOST || '127.0.0.1',
+      port,
+      user: MYSQL_USER,
+      password: MYSQL_PASSWORD,
+      database: MYSQL_DATABASE,
+      charset: 'utf8mb4',
+      timezone: 'Z',
+      jsonStrings: true,
+      connectionLimit: 10,
+    });
+  }
+  return pool;
 }
 
-let client;
-
-async function getClient() {
-  if (!client) client = new MongoClient(MONGO_URI);
-  if (!client.topology?.isConnected()) await client.connect();
-  return client;
+async function query(sql, params = [], connection = getPool()) {
+  const [result] = await connection.execute(sql, params);
+  return result;
 }
 
-async function getDb(dbName = 'analista_digital_db') {
-  const c = await getClient();
-  return c.db(dbName);
+async function transaction(run) {
+  const connection = await getPool().getConnection();
+  try {
+    await connection.beginTransaction();
+    const result = await run(connection);
+    await connection.commit();
+    return result;
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+  } finally {
+    connection.release();
+  }
 }
 
-module.exports = { getClient, getDb };
+async function closePool() {
+  if (pool) await pool.end();
+  pool = undefined;
+}
+
+module.exports = { query, transaction, closePool };

@@ -1,50 +1,30 @@
-// src/models/companyModel.js
-const { ObjectId } = require('mongodb');
-const { getDb } = require('../Config/db');
+const { query, transaction } = require('../Config/db');
+const { decode, insert, update } = require('./sqlRecords');
 
-const COLLECTION = 'companies';
-
-async function ensureIndexes() {
-  const db = await getDb();
-  // cnpj único (opcionalmente sparse se nem todas têm cnpj)
-  await db.collection(COLLECTION).createIndex({ cnpj: 1 }, { unique: true, sparse: true });
-}
+const jsonFields = ['contact', 'address', 'complianceChecklist'];
+const editable = ['name', 'cnpj', 'contact', 'address', 'plan', 'createdBy', 'complianceChecklist', 'updatedAt'];
 
 async function findById(id) {
-  const db = await getDb();
-  return db.collection(COLLECTION).findOne({ _id: new ObjectId(id) });
+  const [row] = await query('SELECT * FROM companies WHERE id = ?', [id]);
+  return decode(row, jsonFields);
 }
 
 async function findByCnpj(cnpjDigits) {
-  const db = await getDb();
-  return db.collection(COLLECTION).findOne({ cnpj: String(cnpjDigits) });
+  const [row] = await query('SELECT * FROM companies WHERE cnpj = ?', [String(cnpjDigits)]);
+  return decode(row, jsonFields);
 }
 
-async function create({ name, cnpj, contact, address, plan = 'free', createdBy = null }) {
-  await ensureIndexes();
-  const db = await getDb();
-  const doc = {
-    name,
-    cnpj: cnpj ? String(cnpj).replace(/\D/g, '') : null,
-    contact: contact || {},
-    address: address || {},
-    plan,
-    createdBy: createdBy ? new ObjectId(createdBy) : null,
-    createdAt: new Date(),
-    updatedAt: new Date(),
-  };
-  const ins = await db.collection(COLLECTION).insertOne(doc);
-  return { ...doc, _id: ins.insertedId };
+async function create({ name, cnpj, contact, address, plan = 'free', createdBy = null }, connection) {
+  const now = new Date();
+  return insert('companies', {
+    name, cnpj: cnpj ? String(cnpj).replace(/\D/g, '') || null : null,
+    contact: contact || {}, address: address || {}, plan, createdBy, createdAt: now, updatedAt: now,
+  }, jsonFields, connection);
 }
 
-async function updateById(id, patch) {
-  const db = await getDb();
-  const { value } = await db.collection(COLLECTION).findOneAndUpdate(
-    { _id: new ObjectId(id) },
-    { $set: patch },
-    { returnDocument: 'after' }
-  );
-  return value;
+async function updateById(id, patch, connection) {
+  if (connection) return update('companies', id, patch, editable, jsonFields, connection);
+  return transaction(conn => update('companies', id, patch, editable, jsonFields, conn));
 }
 
 module.exports = { findById, findByCnpj, create, updateById };

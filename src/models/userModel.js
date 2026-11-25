@@ -1,68 +1,38 @@
-// src/models/userModel.js
-const { ObjectId } = require('mongodb');
-const { getDb } = require('../Config/db');
+const { query, transaction } = require('../Config/db');
+const { decode, insert, update } = require('./sqlRecords');
 
-const COLLECTION = 'users';
-
-async function ensureIndexes() {
-  const db = await getDb();
-  await db.collection(COLLECTION).createIndex({ email: 1 }, { unique: true });
-  await db.collection(COLLECTION).createIndex({ companyId: 1 });
-}
+const jsonFields = ['settings'];
+const editable = ['email', 'passwordHash', 'name', 'role', 'companyId', 'status', 'settings', 'lastLoginAt', 'updatedAt'];
 
 async function findByEmail(email) {
-  const db = await getDb();
-  return db.collection(COLLECTION).findOne({ email: String(email).toLowerCase().trim() });
+  const [row] = await query('SELECT * FROM users WHERE email = ?', [String(email).toLowerCase().trim()]);
+  return decode(row, jsonFields);
 }
 
 async function findById(id) {
-  const db = await getDb();
-  return db.collection(COLLECTION).findOne({ _id: new ObjectId(id) });
+  const [row] = await query('SELECT * FROM users WHERE id = ?', [id]);
+  return decode(row, jsonFields);
 }
 
-async function create({ email, passwordHash, name, role = 'user', companyId = null, status = 'active', settings = {} }) {
-  await ensureIndexes();
-  const db = await getDb();
-  const doc = {
-    email: String(email).toLowerCase().trim(),
-    passwordHash,
-    name: name || null,
-    role,
-    companyId: companyId ? new ObjectId(companyId) : null,
-    status,
-    settings,
-    createdAt: new Date(),
-    updatedAt: new Date(),
-  };
-  const ins = await db.collection(COLLECTION).insertOne(doc);
-  return { ...doc, _id: ins.insertedId };
+async function create({ email, passwordHash, name, role = 'user', companyId = null, status = 'active', settings = {} }, connection) {
+  const now = new Date();
+  return insert('users', {
+    email: String(email).toLowerCase().trim(), passwordHash, name: name || null,
+    role, companyId, status, settings, createdAt: now, updatedAt: now,
+  }, jsonFields, connection);
 }
 
 async function updateById(id, patch) {
-  const db = await getDb();
-  // converte companyId se vier string
-  if (patch.companyId && typeof patch.companyId === 'string') {
-    patch.companyId = new ObjectId(patch.companyId);
-  }
-  const { value } = await db.collection(COLLECTION).findOneAndUpdate(
-    { _id: new ObjectId(id) },
-    { $set: patch },
-    { returnDocument: 'after' }
-  );
-  return value;
+  return transaction(connection => update('users', id, patch, editable, jsonFields, connection));
 }
 
 async function findAllByCompany(companyId) {
-  const db = await getDb();
-  return db
-    .collection(COLLECTION)
-    .find({ companyId: new ObjectId(companyId) })
-    .toArray();
+  const rows = await query('SELECT * FROM users WHERE companyId = ?', [companyId]);
+  return rows.map(row => decode(row, jsonFields));
 }
 
 async function removeById(id) {
-  const db = await getDb();
-  await db.collection(COLLECTION).deleteOne({ _id: new ObjectId(id) });
+  await query('DELETE FROM users WHERE id = ?', [id]);
 }
 
 module.exports = { findByEmail, findById, create, updateById, findAllByCompany, removeById };

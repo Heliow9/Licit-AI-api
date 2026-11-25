@@ -4,6 +4,7 @@ const jwt = require('jsonwebtoken');
 const { BCRYPT_ROUNDS, JWT_SECRET, JWT_EXPIRES, ALLOW_OPEN_REG } = require('../Config/env');
 const Users = require('../models/userModel');
 const Companies = require('../models/companyModel');
+const { transaction } = require('../Config/db');
 
 function sanitize(u) {
   if (!u) return null;
@@ -30,33 +31,24 @@ async function register(req, res) {
     const exists = await Users.findByEmail(email);
     if (exists) return res.status(409).json({ error: 'Email já cadastrado.' });
 
-    // Se veio um objeto company, criamos a empresa e o usuário como 'owner'
-    let companyId = null;
-    if (company?.name) {
-      const comp = await Companies.create({
-        name: company.name,
-        cnpj: company.cnpj,
-        createdBy: null, // definiremos depois que tivermos o _id do user
-        contact: company.contact,
-        address: company.address,
-        plan: company.plan || 'free'
-      });
-      companyId = comp._id;
-    }
-
     const passwordHash = await bcrypt.hash(password, BCRYPT_ROUNDS);
-    const role = companyId ? 'owner' : 'user';
-
-    const user = await Users.create({ email, passwordHash, name, role, companyId });
-    // se criamos empresa acima, set createdBy
-    if (companyId) {
-      await Companies.updateMy(companyId, { createdBy: user._id });
-    }
+    const user = await transaction(async connection => {
+      const comp = company?.name ? await Companies.create({
+        name: company.name, cnpj: company.cnpj, contact: company.contact, address: company.address,
+        plan: company.plan || 'free',
+      }, connection) : null;
+      const created = await Users.create({
+        email, passwordHash, name, companyId: comp?._id, role: comp ? 'owner' : 'user',
+      }, connection);
+      if (comp) await Companies.updateById(comp._id, { createdBy: created._id }, connection);
+      return created;
+    });
 
     const token = sign(user);
     res.json({ token, user: sanitize(user) });
   } catch (e) {
-    console.error('register error:', e);
+    if (e.code === 'ER_DUP_ENTRY') return res.status(409).json({ error: 'Email ou CNPJ já cadastrado.' });
+    console.error('register error:', e.code || e.name);
     res.status(500).json({ error: 'Erro ao registrar.' });
   }
 }

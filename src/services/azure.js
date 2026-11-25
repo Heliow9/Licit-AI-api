@@ -25,7 +25,7 @@ async function withRetry(
     baseDelayMs = 1200,
     maxDelayMs = 60_000,
     maxAttempts = 12,
-    attemptTimeoutMs = 45_000, // NOVO: timeout por tentativa
+    attemptTimeoutMs = 45_000, // timeout por tentativa
     label = 'AzureCall',
   } = {}
 ) {
@@ -77,10 +77,23 @@ async function withRetry(
 /**
  * Chat de texto simples.
  * @param {string} prompt
- * @param {{temperature?: number, system?: string, user?: string}} [opts]
+ * @param {{
+ *  temperature?: number,
+ *  system?: string,
+ *  user?: string,
+ *  max_tokens?: number,
+ *  response_format?: { type: 'json_object' | 'text' | string }
+ * }} [opts]
  */
 async function chatText(prompt, opts = {}) {
-  const { temperature = 0.2, system = 'Você é um expert em processos licitórios e editais', user } = opts;
+  const {
+    temperature = 0.2,
+    system = 'Você é um expert em processos licitatórios e editais',
+    user,
+    max_tokens = 2000,
+    response_format // opcional; algumas versões do Azure ainda não suportam
+  } = opts;
+
   const url = joinUrl(BASE_OPENAI, `deployments/${CHAT_DEPLOY}/chat/completions?api-version=${AZ_VER}`);
   const body = {
     messages: [
@@ -88,7 +101,9 @@ async function chatText(prompt, opts = {}) {
       { role: 'user', content: prompt }
     ],
     temperature,
-    ...(user ? { user } : {}) // passa o “tenant/user” para auditoria/rate-limiting
+    max_tokens,
+    ...(user ? { user } : {}),
+    ...(response_format ? { response_format } : {})
   };
 
   return await withRetry(async ({ signal }) => {
@@ -143,55 +158,65 @@ async function embedText(text, opts = {}) {
 }
 
 /**
- * Lote de textos -> lote de embeddings (com chunking opcional).
+ * Lote de textos -> lote de embeddings (com chunking + pool de concorrência).
  * @param {string[]} texts
- * @param {{user?: string, chunkSize?: number}} [opts]
+ * @param {{user?: string, chunkSize?: number, concurrency?: number}} [opts]
  * @returns {Promise<number[][]>}
  */
 async function embedTexts(texts, opts = {}) {
   if (!texts || texts.length === 0) return [];
-  const { user, chunkSize = 32 } = opts; // chunk conservador; ajuste se quiser
+  const { user, chunkSize = 32, concurrency = 3 } = opts; // pool leve p/ estabilidade
 
   const url = joinUrl(BASE_OPENAI, `deployments/${EMBED_DEPLOY}/embeddings?api-version=${AZ_VER}`);
 
-  // processa em chunks para não estourar limites
+  // separa em blocos
   const chunks = [];
   for (let i = 0; i < texts.length; i += chunkSize) {
     chunks.push(texts.slice(i, i + chunkSize));
   }
 
-  const results = [];
-  for (const chunk of chunks) {
-    // preserva índice original dentro do chunk
-    const body = { input: chunk, ...(user ? { user } : {}) };
+  const results = new Array(texts.length); // manter posição global
+  let next = 0;
 
-    // cada chunk tem seu próprio retry/timeout
-    const vecs = await withRetry(async ({ signal }) => {
-      const r = await _fetch(url, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'api-key': AZ_KEY
-        },
-        body: JSON.stringify(body),
-        signal
-      });
-      if (!r.ok) {
-        const txt = await r.text().catch(() => '');
-        const err = new Error(`HTTP ${r.status} - ${txt}`);
-        err.response = r;
-        throw err;
+  async function worker() {
+    while (next < chunks.length) {
+      const myIdx = next++;
+      const chunk = chunks[myIdx];
+      const baseIndex = myIdx * chunkSize;
+
+      const body = { input: chunk, ...(user ? { user } : {}) };
+
+      const vecs = await withRetry(async ({ signal }) => {
+        const r = await _fetch(url, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'api-key': AZ_KEY
+          },
+          body: JSON.stringify(body),
+          signal
+        });
+        if (!r.ok) {
+          const txt = await r.text().catch(() => '');
+          const err = new Error(`HTTP ${r.status} - ${txt}`);
+          err.response = r;
+          throw err;
+        }
+        const j = await r.json();
+        // Azure retorna data[{ index, embedding }]
+        const map = new Map(j.data.map(item => [item.index, item.embedding]));
+        return chunk.map((_, idx) => map.get(idx) || []);
+      }, { label: 'EmbedBatch' });
+
+      for (let i = 0; i < vecs.length; i++) {
+        results[baseIndex + i] = vecs[i];
       }
-      const j = await r.json();
-      // Azure retorna data[{ index, embedding }]
-      const map = new Map(j.data.map(item => [item.index, item.embedding]));
-      return chunk.map((_, idx) => map.get(idx) || []);
-    }, { label: 'EmbedBatch' });
-
-    results.push(...vecs);
+    }
   }
 
-  // results já está na ordem original por construção
+  const workers = Array.from({ length: Math.min(concurrency, chunks.length) }, () => worker());
+  await Promise.all(workers);
+
   return results;
 }
 

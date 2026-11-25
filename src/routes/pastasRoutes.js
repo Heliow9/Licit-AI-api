@@ -3,10 +3,10 @@ const { Router } = require('express');
 const fs = require('fs');
 const fsp = require('fs/promises');
 const path = require('path');
-const { ObjectId } = require('mongodb');
 
 const { authMiddleware } = require('../middlewares/authMiddleware');
-const { getDb } = require('../Config/db');
+const { requireCompany } = require('../middlewares/companyScope');
+const Cats = require('../models/catModel');
 const { CATS_ROOT } = require('../Config/env');
 
 const router = Router();
@@ -39,8 +39,7 @@ function isAdminRole(role) {
   return role === 'admin' || role === 'owner';
 }
 
-// Todas as rotas abaixo exigem auth
-router.use(authMiddleware());
+router.use(authMiddleware(), requireCompany);
 
 // ========== ROTA 1: Listar pastas (gestores) da empresa ==========
 // GET /api/pastas
@@ -156,32 +155,22 @@ router.delete('/:folderId/:fileName(*)', async (req, res) => {
     const companyRoot = ensureCompanyRoot(companyId);
     const filePath = resolveSafe(companyRoot, folderId, fileName);
 
-    // 1) remove arquivo do disco
+    const src = `${folderId}/${fileName}`;
+    const deleted = await Cats.remove(companyId, src);
+
     let removedFile = false;
     try {
       await fsp.unlink(filePath);
       removedFile = true;
     } catch (e) {
-      // Se já não existir no disco, seguimos para limpar banco
       if (e.code !== 'ENOENT') throw e;
     }
-
-    // 2) limpa Mongo (cats + chunks)
-    const db = await getDb();
-    const src = `${folderId}/${fileName}`;
-    const companyOid = new ObjectId(companyId);
-
-    const chunksRes = await db.collection('chunks').deleteMany({ companyId: companyOid, source: src });
-    const catsRes   = await db.collection('cats').deleteOne({ companyId: companyOid, source: src });
 
     return res.json({
       ok: true,
       file: { path: filePath, removed: removedFile },
-      mongo: {
-        catsDeleted: catsRes?.deletedCount || 0,
-        chunksDeleted: chunksRes?.deletedCount || 0,
-        source: src,
-      },
+      database: { ...deleted, source: src },
+      mongo: { ...deleted, source: src }, // Compatibilidade com clientes existentes.
     });
   } catch (error) {
     console.error('Erro ao excluir CAT:', error);
